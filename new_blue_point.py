@@ -164,32 +164,84 @@ class AutoPlatinumHand:
             self.refine_move_to_target(chiaki_target)
         return False
 
-    def Realtime_cursor_position(self, gray_frame, template, last_pos):
-        """🚀 局部追蹤邏輯：傳入幀與指針，僅在小區域 ROI 內掃描"""
-        if last_pos is None:
-            return self.detect_template(gray_frame, template, 0.70)
+    def Realtime_cursor_position(self, bgr_frame, template_gray, last_pos, tpl_path='cursor.png'):
+        """🚀 終極動態追蹤：雙重遮罩 (幀差法 Motion + HSV色值驗證 Feature)"""
+        # 0. 初始化狀態與顏色特徵 (懶加載，不改 __init__)
+        attr_prev = f"prev_bgr_{tpl_path.split('.')[0]}"
+        attr_bounds = f"hsv_bounds_{tpl_path.split('.')[0]}"
+
+        if not hasattr(self, attr_bounds):
+            tpl_bgr = cv2.imread(tpl_path, cv2.IMREAD_COLOR)
+            if tpl_bgr is not None:
+                th, tw = tpl_bgr.shape[:2]
+                # 提取中心區域(手型核心)顏色作為「純血色值」
+                center_patch = cv2.cvtColor(tpl_bgr[th//2-3:th//2+3, tw//2-3:tw//2+3], cv2.COLOR_BGR2HSV)
+                h, s, v = cv2.mean(center_patch)[:3]
+                # 建立色彩寬容範圍 (容忍壓縮與光影變化)
+                setattr(self, attr_bounds, (
+                    np.array([max(0, h-30), max(0, s-60), max(0, v-60)]),
+                    np.array([min(179, h+30), min(255, s+60), min(255, v+60)])
+                ))
+            else:
+                setattr(self, attr_bounds, None)
+
+        prev_bgr = getattr(self, attr_prev, None)
+        setattr(self, attr_prev, bgr_frame.copy()) # 更新歷史幀供下一幀對沖
+
+        gray_full = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+        if last_pos is None or prev_bgr is None:
+            return self.detect_template(gray_full, template_gray, 0.70)
 
         cx, cy = last_pos
-        h, w = gray_frame.shape
-        roi_size = 60  # ROI 半徑，120x120 的小區域
+        h, w = bgr_frame.shape[:2]
+        roi_size = 120  # 擴大範圍到 240x240，防止滑鼠甩太快飛出
 
         x1, y1 = max(0, cx - roi_size), max(0, cy - roi_size)
         x2, y2 = min(w, cx + roi_size), min(h, cy + roi_size)
-        roi = gray_frame[y1:y2, x1:x2]
 
-        if roi.size == 0: return last_pos
+        th, tw = template_gray.shape
+        if x2 - x1 <= tw or y2 - y1 <= th:
+            return self.detect_template(gray_full, template_gray, 0.70)
 
-        # 提取中間形狀進行局部匹配 (因範圍小，無背景干擾，門檻穩定設為 0.65)
-        res = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        roi_curr = bgr_frame[y1:y2, x1:x2]
+        roi_prev = prev_bgr[y1:y2, x1:x2]
 
-        if max_val > 0.65:
-            new_cx = x1 + max_loc[0] + template.shape[1]//2
-            new_cy = y1 + max_loc[1] + template.shape[0]//2
-            return (new_cx, new_cy)
+        # 1. 第一層過濾：動態遮罩 (Frame Differencing)
+        diff = cv2.absdiff(roi_curr, roi_prev)
+        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        _, motion_mask = cv2.threshold(diff_gray, 20, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
 
-        # 找不到 (例如變成沙漏、被特效遮擋)，直接保持原位不亂跳
-        return last_pos
+        # 💤 休眠省電機制：若畫面靜止(動態像素極少)，判定為沒動，直接回傳上次位置
+        if cv2.countNonZero(motion_mask) < 15:
+            return last_pos
+
+        # 2. 第二層過濾：色彩遮罩 (HSV Validation)
+        bounds = getattr(self, attr_bounds, None)
+        if bounds:
+            roi_hsv = cv2.cvtColor(roi_curr, cv2.COLOR_BGR2HSV)
+            color_mask = cv2.inRange(roi_hsv, bounds[0], bounds[1])
+            # 🎯 雙重遮罩交集：必須「在動」且「顏色對」
+            final_mask = cv2.bitwise_and(motion_mask, color_mask)
+        else:
+            final_mask = motion_mask
+
+        # 3. 形狀與雜訊過濾
+        cnts, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            largest_cnt = max(cnts, key=cv2.contourArea)
+            area = cv2.contourArea(largest_cnt)
+            # 過濾太小的雜訊(面積<10)，以及過渡動畫的巨大閃爍(面積>2500)
+            if 10 < area < 2500:
+                M = cv2.moments(largest_cnt)
+                if M["m00"] != 0:
+                    new_cx = x1 + int(M["m10"] / M["m00"])
+                    new_cy = y1 + int(M["m01"] / M["m00"])
+                    return (new_cx, new_cy)
+
+        # 🚨 全域重捕：如果在 ROI 內動的東西不符合特徵，觸發全螢幕尋找
+        return self.detect_template(gray_full, template_gray, 0.70)
 
     def move_to_target(self, target_pos):
         """長按大範圍移動。"""
@@ -369,12 +421,15 @@ class AutoPlatinumHand:
                     curr_time = time.time()
                     fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 60
                     prev_time = curr_time
-                    # 1. 影片指針追蹤
-                    v_pos = self.Realtime_cursor_position(yt_gray, self.cursor_tpl, self.last_known_cursor_pos)
-                    if v_pos: self.last_known_cursor_pos = v_pos
-                    # 2. 實機指針追蹤 (實機通常沒沙漏，所以不傳 waiting_tpl)
-                    c_pos = self.Realtime_cursor_position(chiaki_gray, self.chiaki_cursor_tpl, self.chaiki_cursor_pos)
-                    if c_pos: self.chaiki_cursor_pos = c_pos
+                    # 1. 影片指針追蹤 (傳入 BGR 彩色幀與模板圖檔名，直接覆寫以清除殘影)
+                    self.last_known_cursor_pos = self.Realtime_cursor_position(
+                        yt_frame, self.cursor_tpl, self.last_known_cursor_pos, 'cursor.png'
+                    )
+                    
+                    # 2. 實機指針追蹤
+                    self.chaiki_cursor_pos = self.Realtime_cursor_position(
+                        chiaki_frame, self.chiaki_cursor_tpl, self.chaiki_cursor_pos, 'cursor2.png'
+                    )
                     
                     key = cv2.waitKey(1) & 0xFF
                     
