@@ -144,12 +144,24 @@ class AutoPlatinumHand:
         return None
 
     def _find_cursor_robust(self, gray_frame, template):
-        """🚀 強化版辨識：使用自適應閾值處理背景，解決吃背景問題 [cite: 2026-03-05]。"""
-        if gray_frame is None or template is None: return None
+        # 防呆 1：如果意外傳入 tuple (例如變數賦值多打了逗號)，自動解包取出陣列
+        if isinstance(gray_frame, tuple):
+            gray_frame = gray_frame[0]
+            
+        # 防呆 2：對齊老版本邏輯，確保物件有效且具備 size 屬性
+        if template is None or gray_frame is None or not hasattr(gray_frame, 'size') or gray_frame.size == 0:
+            return None
+            
+        # 防呆 3：確保長寬大於自適應閾值的 block size (11)，避免底層崩潰
+        if gray_frame.shape[0] < 11 or gray_frame.shape[1] < 11:
+            return None
+            
         thresh_frame = cv2.adaptiveThreshold(gray_frame, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
         _, thresh_tpl = cv2.threshold(template, 127, 255, cv2.THRESH_BINARY)
+        
         res = cv2.matchTemplate(thresh_frame, thresh_tpl, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        
         if max_val > 0.65: 
             return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2)
         return None
