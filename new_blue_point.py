@@ -139,58 +139,19 @@ class AutoPlatinumHand:
         if template is None or gray_frame is None or gray_frame.size == 0: return None
         res = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val > threshold:
-            return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2)
-        return None
+        return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2) if max_val > threshold else None
 
-    def _find_cursor_robust(self, gray_frame, template):
-        # 防呆 1：如果意外傳入 tuple (例如變數賦值多打了逗號)，自動解包取出陣列
-        if isinstance(gray_frame, tuple):
-            gray_frame = gray_frame[0]
-            
-        # 防呆 2：對齊老版本邏輯，確保物件有效且具備 size 屬性
-        if template is None or gray_frame is None or not hasattr(gray_frame, 'size') or gray_frame.size == 0:
-            return None
-            
-        # 防呆 3：確保長寬大於自適應閾值的 block size (11)，避免底層崩潰
-        if gray_frame.shape[0] < 11 or gray_frame.shape[1] < 11:
-            return None
-            
-        thresh_frame = cv2.adaptiveThreshold(gray_frame, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        _, thresh_tpl = cv2.threshold(template, 127, 255, cv2.THRESH_BINARY)
-        
-        res = cv2.matchTemplate(thresh_frame, thresh_tpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        
-        if max_val > 0.65: 
-            return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2)
-        return None
+    def track_video_cursor(self, target_pos, current_pos):
+        """🚀 追趕邏輯：傳入影片與實機的絕對座標，進行移動"""
+        if not target_pos or not current_pos: return False
 
-    def track_video_cursor(self, current_gray, prev_gray):
-        """🚀 幀差法追蹤：定位影片中的移動物體 [cite: 2026-03-05]。"""
-        if prev_gray is None: return self.last_known_cursor_pos
-        diff = cv2.absdiff(current_gray, prev_gray)
-        _, diff_thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-        M = cv2.moments(diff_thresh)
-        if M["m00"] > 50: 
-            new_pos = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-            if self.last_known_cursor_pos:
-                dist = math.hypot(new_pos[0] - self.last_known_cursor_pos[0], new_pos[1] - self.last_known_cursor_pos[1])
-                if dist > 2: self.last_known_cursor_pos = new_pos
-        return self.last_known_cursor_pos
-
-    def Realtime_cursor_position(self):
-        """功能：判斷實機是否已對齊影片目標，並分發移動策略。"""
-        target_pos = self.last_known_cursor_pos
-        if not self.chaiki_cursor_pos or not target_pos: return False
-
-        # 🎯 核心修正：套用縮放比映射到實機座標
+        # 套用縮放比映射到實機座標
         chiaki_target_x = int(target_pos[0] / self.scale_x)
         chiaki_target_y = int(target_pos[1] / self.scale_y)
         chiaki_target = (chiaki_target_x, chiaki_target_y)
         
-        dx = chiaki_target_x - self.chaiki_cursor_pos[0]
-        dy = chiaki_target_y - self.chaiki_cursor_pos[1]
+        dx = chiaki_target_x - current_pos[0]
+        dy = chiaki_target_y - current_pos[1]
         dist = math.hypot(dx, dy)
 
         if dist <= self.deadzone:
@@ -202,6 +163,33 @@ class AutoPlatinumHand:
         else:
             self.refine_move_to_target(chiaki_target)
         return False
+
+    def Realtime_cursor_position(self, gray_frame, template, last_pos):
+        """🚀 局部追蹤邏輯：傳入幀與指針，僅在小區域 ROI 內掃描"""
+        if last_pos is None:
+            return self.detect_template(gray_frame, template, 0.70)
+
+        cx, cy = last_pos
+        h, w = gray_frame.shape
+        roi_size = 60  # ROI 半徑，120x120 的小區域
+
+        x1, y1 = max(0, cx - roi_size), max(0, cy - roi_size)
+        x2, y2 = min(w, cx + roi_size), min(h, cy + roi_size)
+        roi = gray_frame[y1:y2, x1:x2]
+
+        if roi.size == 0: return last_pos
+
+        # 提取中間形狀進行局部匹配 (因範圍小，無背景干擾，門檻穩定設為 0.65)
+        res = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+        if max_val > 0.65:
+            new_cx = x1 + max_loc[0] + template.shape[1]//2
+            new_cy = y1 + max_loc[1] + template.shape[0]//2
+            return (new_cx, new_cy)
+
+        # 找不到 (例如變成沙漏、被特效遮擋)，直接保持原位不亂跳
+        return last_pos
 
     def move_to_target(self, target_pos):
         """長按大範圍移動。"""
@@ -350,7 +338,7 @@ class AutoPlatinumHand:
     # 執行循環
     # ==========================================
 
-    def run_live_sync(self, start_time_sec=35):
+    def run_live_sync(self, start_time_sec=153):
         with sync_playwright() as p:
             # --- Playwright 與影片同步啟動 ---
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
@@ -381,21 +369,18 @@ class AutoPlatinumHand:
                     curr_time = time.time()
                     fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 60
                     prev_time = curr_time
-                    
-                    # 找回遺失的影片指針追蹤邏輯
-                    v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
+                    # 1. 影片指針追蹤
+                    v_pos = self.Realtime_cursor_position(yt_gray, self.cursor_tpl, self.last_known_cursor_pos)
                     if v_pos: self.last_known_cursor_pos = v_pos
-                    
-                    # 1. 先嘗試高精度的抗干擾辨識
-                    c_pos = self._find_cursor_robust(chiaki_gray, self.chiaki_cursor_tpl)
-                    
-                    # 2. [新增保底] 如果抗干擾模式太嚴格導致找不到，退回一般模式，避免 GUI 輔助線消失
-                    if not c_pos:
-                        c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.60)
-                    
+                    # 2. 實機指針追蹤 (實機通常沒沙漏，所以不傳 waiting_tpl)
+                    c_pos = self.Realtime_cursor_position(chiaki_gray, self.chiaki_cursor_tpl, self.chaiki_cursor_pos)
                     if c_pos: self.chaiki_cursor_pos = c_pos
+                    
                     key = cv2.waitKey(1) & 0xFF
-                    if recording: self.Realtime_cursor_position()
+                    
+                    # 3. 處理追趕邏輯
+                    if recording: 
+                      self.track_video_cursor(self.last_known_cursor_pos, self.chaiki_cursor_pos)
                     if key == ord(' '):
                         if not recording:
                             page.evaluate("document.querySelector('video').play()")
