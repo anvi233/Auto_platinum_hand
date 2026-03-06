@@ -374,11 +374,25 @@ class AutoPlatinumHand:
                     if full_frame is None: continue
                     yt_frame = full_frame[self.yt_y:self.yt_y+self.yt_h, self.yt_x:self.yt_x+self.yt_w]
                     chiaki_frame = full_frame[self.chiaki_y:self.chiaki_y+self.chiaki_h, self.chiaki_x:self.chiaki_x+self.chiaki_w]
-                    chiaki_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY), cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
+                    
+                    yt_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY)
+                    chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
+                    
                     curr_time = time.time()
                     fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 60
                     prev_time = curr_time
+                    
+                    # 找回遺失的影片指針追蹤邏輯
+                    v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
+                    if v_pos: self.last_known_cursor_pos = v_pos
+                    
+                    # 1. 先嘗試高精度的抗干擾辨識
                     c_pos = self._find_cursor_robust(chiaki_gray, self.chiaki_cursor_tpl)
+                    
+                    # 2. [新增保底] 如果抗干擾模式太嚴格導致找不到，退回一般模式，避免 GUI 輔助線消失
+                    if not c_pos:
+                        c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.60)
+                    
                     if c_pos: self.chaiki_cursor_pos = c_pos
                     key = cv2.waitKey(1) & 0xFF
                     if recording: self.Realtime_cursor_position()
