@@ -5,8 +5,6 @@ import time
 import dxcam 
 import torch 
 import win32gui
-import win32api
-import win32con
 from playwright.sync_api import sync_playwright
 
 class AutoPlatinumHand:
@@ -42,12 +40,6 @@ class AutoPlatinumHand:
         self.last_waiting_ms = 0.0
         self.last_time_ms = 0.0
         self.last_full_gray_np = None
-
-        # --- 補齊：移動控制參數 ---
-        self.deadzone = 8
-        self.key_states = {'up': False, 'down': False, 'left': False, 'right': False}
-        self.prev_roi_patch = None
-        self.roi_box = None
 
     # ==========================================
     # 區塊 A：初始化與窗口對齊 (Ready 階段)
@@ -135,255 +127,119 @@ class AutoPlatinumHand:
     # 區塊 B：指針追蹤與移動邏輯 (Movement)
     # ==========================================
 
+    # opencv的工作全部給到YOLO去做，不需要一個GUI了，detect_template你看還需要不需要，還是用YOLO的方式重寫一下
     def detect_template(self, gray_frame, template, threshold=0.70):
         if template is None or gray_frame is None or gray_frame.size == 0: return None
         res = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2) if max_val > threshold else None
+        if max_val > threshold:
+            return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2)
+        return None
 
-    def track_video_cursor(self, target_pos, current_pos):
-        """🚀 追趕邏輯：傳入影片與實機的絕對座標，進行移動"""
-        if not target_pos or not current_pos: return False
+    # 用YOLO替代opencv的模板匹配，track_video_cursor和Realtime_cursor_position合併為Realtime_cursor_position
+    # 同時獲取影片和實機的指針位置，現在不需要實時移動
+    # # is_scene_change is_roi_change is_cursor_change click_check need_stop_for_sync execute_click合併
+    # 邏輯現在為 判斷 scene_change  roi_change cursor_change時都做點擊，點擊帶一個實時的影片指針座標進隊列，然後條用move_action或refine_move控制chiaki指針移動到位置點擊
+    # 也就是説現在chiaki的執行會有一定的延遲。
+    # 點擊要有一個最小的間隔時間，避免過於頻繁的點擊（暫時算200ms）
+    # 指針移動時，大概每60幀（2秒）要模糊匹配一下遊戲畫面的邊沿15%的框，判斷兩邊畫面是否同步，如果連續3次匹配不通過，自動暫停影片，讓chaiki那邊繼續執行，知道匹配成功自動繼續
 
-        # 套用縮放比映射到實機座標
-        chiaki_target_x = int(target_pos[0] / self.scale_x)
-        chiaki_target_y = int(target_pos[1] / self.scale_y)
-        chiaki_target = (chiaki_target_x, chiaki_target_y)
-        
-        dx = chiaki_target_x - current_pos[0]
-        dy = chiaki_target_y - current_pos[1]
-        dist = math.hypot(dx, dy)
+    # def track_video_cursor(self, current_gray, prev_gray):
+    #     pass
 
-        if dist <= self.deadzone:
-            self.release_all_keys()
-            return True
+    def Realtime_cursor_position(self):
+        pass
 
-        if dist > 35:
-            self.move_to_target(chiaki_target)
-        else:
-            self.refine_move_to_target(chiaki_target)
-        return False
+    def move_action(self, target_pos):
+        pass
 
-    def Realtime_cursor_position(self, bgr_frame, last_pos, tpl_path):
-        """🚀 終極特徵追蹤：只靠「專屬顏色」與「真實面積」直接定位"""
-        attr_feat = f"feat_{tpl_path.split('.')[0]}"
-
-        # ==========================================
-        # 1. 特徵提取：自動去純色背景，提取面積與重心色值 (只執行一次)
-        # ==========================================
-        if not hasattr(self, attr_feat):
-            tpl_img = cv2.imread(tpl_path, cv2.IMREAD_COLOR)
-            if tpl_img is not None:
-                th, tw = tpl_img.shape[:2]
-                # 取左上角像素作為背景色 (黑底或白底)
-                bg_color = tpl_img[0, 0]
-                
-                # 建立背景遮罩 (容忍 +-10 的截圖色差)
-                lower_bg = np.clip(bg_color - 10, 0, 255)
-                upper_bg = np.clip(bg_color + 10, 0, 255)
-                bg_mask = cv2.inRange(tpl_img, lower_bg, upper_bg)
-                
-                # 反轉得到「真實手型遮罩」
-                fg_mask = cv2.bitwise_not(bg_mask)
-                
-                # 特徵 A：真實像素面積
-                true_area = cv2.countNonZero(fg_mask)
-                if true_area == 0: true_area = tw * th
-                
-                # 特徵 B：計算幾何重心取色
-                M = cv2.moments(fg_mask)
-                if M["m00"] != 0:
-                    cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-                else:
-                    cx, cy = tw // 2, th // 2
-                    
-                hsv_tpl = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2HSV)
-                h, s, v = hsv_tpl[cy, cx]
-                
-                setattr(self, attr_feat, {
-                    'area': true_area,
-                    # 色值容差：保護光影變化
-                    'hsv_bounds': (
-                        np.array([max(0, h-25), max(0, s-60), max(0, v-60)]),
-                        np.array([min(179, h+25), min(255, s+60), min(255, v+60)])
-                    )
-                })
-            else:
-                return last_pos # 讀圖失敗防呆
-
-        # ==========================================
-        # 2. 直接定位：用顏色 + 面積尋找目標
-        # ==========================================
-        feat = getattr(self, attr_feat)
-        target_area = feat['area']
-        lower_hsv, upper_hsv = feat['hsv_bounds']
-        
-        # 建立搜索 ROI (大幅減少全螢幕雜訊干擾，提高效能)
-        h, w = bgr_frame.shape[:2]
-        if last_pos is not None:
-            roi_size = 150
-            cx, cy = last_pos
-            x1, y1 = max(0, cx - roi_size), max(0, cy - roi_size)
-            x2, y2 = min(w, cx + roi_size), min(h, cy + roi_size)
-        else:
-            x1, y1, x2, y2 = 0, 0, w, h
-            
-        roi_bgr = bgr_frame[y1:y2, x1:x2]
-        roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-        
-        # 顏色過濾出所有候選區域
-        color_mask = cv2.inRange(roi_hsv, lower_hsv, upper_hsv)
-        cnts, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_pos = None
-        min_area_diff = float('inf')
-
-        # 從候選區域中，找出面積最符合「真實手型」的那一個
-        for c in cnts:
-            cnt_area = cv2.contourArea(c)
-            # 容忍 0.4x ~ 2.5x 的面積變化 (手轉向、變成放大鏡等)
-            if target_area * 0.4 < cnt_area < target_area * 2.5:
-                area_diff = abs(cnt_area - target_area)
-                if area_diff < min_area_diff:
-                    min_area_diff = area_diff
-                    M = cv2.moments(c)
-                    if M["m00"] != 0:
-                        best_pos = (x1 + int(M["m10"] / M["m00"]), y1 + int(M["m01"] / M["m00"]))
-
-        if best_pos:
-            return best_pos
-
-        # 完全找不到，就乖乖待在原地，保留記憶！
-        return last_pos
-
-    def move_to_target(self, target_pos):
-        """長按大範圍移動。"""
-        dx = target_pos[0] - self.chaiki_cursor_pos[0]
-        dy = target_pos[1] - self.chaiki_cursor_pos[1]
-        self.update_key_bg('right', dx > self.deadzone)
-        self.update_key_bg('left', dx < -self.deadzone)
-        self.update_key_bg('down', dy > self.deadzone)
-        self.update_key_bg('up', dy < -self.deadzone)
-
-    def refine_move_to_target(self, target_pos):
-        """🎯 按幀計算的像素級微調。"""
-        dx = target_pos[0] - self.chaiki_cursor_pos[0]
-        dy = target_pos[1] - self.chaiki_cursor_pos[1]
-        fine_dz = 2 
-        self.update_key_bg('right', dx > fine_dz)
-        self.update_key_bg('left', dx < -fine_dz)
-        self.update_key_bg('down', dy > fine_dz)
-        self.update_key_bg('up', dy < -fine_dz)
-
-    def update_key_bg(self, key_str, press):
-        """後台注入按鍵消息"""
-        if not self.chiaki_hwnd: return
-        vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT, 'enter': win32con.VK_RETURN}
-        vk = vk_map.get(key_str)
-        if self.key_states.get(key_str) != press:
-            if press: win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk, 0)
-            else: win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk, 0)
-            self.key_states[key_str] = press
-
-    def release_all_keys(self):
-        """釋放所有方向鍵"""
-        for k in ['up', 'down', 'left', 'right']: self.update_key_bg(k, False)
+    def refine_move(self, target_pos):
+        pass
+    
+    def click_action(self, target_pos):
+        pass
 
     # ==========================================
     # 區塊 C：點擊決策與同步暫停 (Logic & Sync)
     # ==========================================
+    # def is_scene_change(self, frame_hash, prev_hash):
+    #     pass
 
-    def execute_queue_logic(self):
-        """🚀 任務分派器：監聽 Queue，Hover 完成後執行 Click 並掛起 [cite: 2026-03-05]。"""
-        if not self.queue: return 
-        task = self.queue[0]
-        if task.get("type") in ["HOVER", "MOVE"]:
-            if self.Realtime_cursor_position(): self.queue.pop(0)
-            return
-        if task.get("type") == "CLICK":
-            if self.Realtime_cursor_position():
-                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
-                time.sleep(0.05)
-                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
-                self.queue.pop(0)
-                self.state = "IDLE"
+    # def is_roi_change(self, current_roi, prev_roi):
+    #     pass
+
+    # def is_cursor_change(self, frame):
+    #     pass
+
+    # def click_check(self, is_scene, is_roi, is_wait, current_ms):
+    #     pass
+
+    def sync_check(self):
+        pass
+
+    # def execute_click(self, queue_item):
+    #     pass
+
+    # def execute_queue_logic(self):
+    #     pass
 
     # ==========================================
     # 區塊 D：視覺化與日誌 (UI & Log)
     # ==========================================
 
-    def draw_8_lines(self, overlay, cx, cy, w, h, color):
-        """繪製八向百分比輔助線"""
-        diag = math.hypot(w, h)
-        left_pct = int((cx / w) * 100) if w > 0 else 0
-        right_pct = int(((w - cx) / w) * 100) if w > 0 else 0
-        top_pct = int((cy / h) * 100) if h > 0 else 0
-        bottom_pct = int(((h - cy) / h) * 100) if h > 0 else 0
-        tl_pct = int((math.hypot(cx, cy) / diag) * 100) if diag > 0 else 0
-        tr_pct = int((math.hypot(w - cx, cy) / diag) * 100) if diag > 0 else 0
-        bl_pct = int((math.hypot(cx, h - cy) / diag) * 100) if diag > 0 else 0
-        br_pct = int((math.hypot(w - cx, h - cy) / diag) * 100) if diag > 0 else 0
+    # def draw_8_lines(self, overlay, cx, cy, w, h, color):
+    #     """繪製八向百分比輔助線"""
+    #     diag = math.hypot(w, h)
+    #     left_pct = int((cx / w) * 100) if w > 0 else 0
+    #     right_pct = int(((w - cx) / w) * 100) if w > 0 else 0
+    #     top_pct = int((cy / h) * 100) if h > 0 else 0
+    #     bottom_pct = int(((h - cy) / h) * 100) if h > 0 else 0
+    #     tl_pct = int((math.hypot(cx, cy) / diag) * 100) if diag > 0 else 0
+    #     tr_pct = int((math.hypot(w - cx, cy) / diag) * 100) if diag > 0 else 0
+    #     bl_pct = int((math.hypot(cx, h - cy) / diag) * 100) if diag > 0 else 0
+    #     br_pct = int((math.hypot(w - cx, h - cy) / diag) * 100) if diag > 0 else 0
 
-        cv2.line(overlay, (cx, cy), (cx, 0), color, 1) 
-        cv2.putText(overlay, f"{top_pct}%", (cx + 5, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (cx, h), color, 1) 
-        cv2.putText(overlay, f"{bottom_pct}%", (cx + 5, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (0, cy), color, 1) 
-        cv2.putText(overlay, f"{left_pct}%", (cx // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (w, cy), color, 1) 
-        cv2.putText(overlay, f"{right_pct}%", (cx + (w - cx) // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (0, 0), color, 1) 
-        cv2.putText(overlay, f"{tl_pct}%", (cx // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (w, 0), color, 1) 
-        cv2.putText(overlay, f"{tr_pct}%", (cx + (w - cx) // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (0, h), color, 1) 
-        cv2.putText(overlay, f"{bl_pct}%", (cx // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        cv2.line(overlay, (cx, cy), (w, h), color, 1) 
-        cv2.putText(overlay, f"{br_pct}%", (cx + (w - cx) // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (cx, 0), color, 1) 
+    #     cv2.putText(overlay, f"{top_pct}%", (cx + 5, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (cx, h), color, 1) 
+    #     cv2.putText(overlay, f"{bottom_pct}%", (cx + 5, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (0, cy), color, 1) 
+    #     cv2.putText(overlay, f"{left_pct}%", (cx // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (w, cy), color, 1) 
+    #     cv2.putText(overlay, f"{right_pct}%", (cx + (w - cx) // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (0, 0), color, 1) 
+    #     cv2.putText(overlay, f"{tl_pct}%", (cx // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (w, 0), color, 1) 
+    #     cv2.putText(overlay, f"{tr_pct}%", (cx + (w - cx) // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (0, h), color, 1) 
+    #     cv2.putText(overlay, f"{bl_pct}%", (cx // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    #     cv2.line(overlay, (cx, cy), (w, h), color, 1) 
+    #     cv2.putText(overlay, f"{br_pct}%", (cx + (w - cx) // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    def process_roi_focus(self, gray_frame, anchor_pos, roi_size=60, cursor_size=15):
-        """🚀 焦點核心 (單幀處理)"""
-        if gray_frame is None or anchor_pos is None: return None, None
-        cx, cy = anchor_pos
-        h, w = gray_frame.shape
-        x1, y1 = max(0, cx - roi_size), max(0, cy - roi_size)
-        x2, y2 = min(w, cx + roi_size), min(h, cy + roi_size)
-        roi_box = (x1, y1, x2, y2)
-        if x2 - x1 <= cursor_size * 2 or y2 - y1 <= cursor_size * 2: return None, roi_box
-        patch = cv2.GaussianBlur(gray_frame[y1:y2, x1:x2].copy(), (5, 5), 0)
-        ph, pw = patch.shape
-        ix1, iy1 = max(0, pw//2 - cursor_size), max(0, ph//2 - cursor_size)
-        ix2, iy2 = min(pw, pw//2 + cursor_size), min(ph, ph//2 + cursor_size)
-        patch[iy1:iy2, ix1:ix2] = 0
-        return patch, roi_box
-    
-    def draw_sync_hud(self, frame, video_pos, chiaki_pos, fps):
-        """獨立繪製 GUI：整合輔助線繪製與縮放邏輯"""
-        self.current_roi_patch, self.roi_box = self.process_roi_focus(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), video_pos)
-        overlay = frame.copy()
-        if self.roi_box:
-            cv2.rectangle(overlay, (self.roi_box[0], self.roi_box[1]), (self.roi_box[2], self.roi_box[3]), (0, 255, 0), 2)
+    # def draw_sync_hud(self, frame, video_pos, chiaki_pos, fps):
+    #     """獨立繪製 GUI：整合輔助線繪製與縮放邏輯"""
+    #     overlay = frame.copy()
         
-        # 繪製影片橘色 8 線
-        if video_pos:
-            self.draw_8_lines(overlay, video_pos[0], video_pos[1], self.yt_w, self.yt_h, (0, 165, 255))
+    #     # 繪製影片橘色 8 線
+    #     if video_pos:
+    #         self.draw_8_lines(overlay, video_pos[0], video_pos[1], self.yt_w, self.yt_h, (0, 165, 255))
         
-        # 繪製實機藍色 8 線 (需套用邏輯縮放比)
-        mapped_cx, mapped_cy = 0, 0
-        if chiaki_pos:
-            mapped_cx = int(chiaki_pos[0] * self.scale_x)
-            mapped_cy = int(chiaki_pos[1] * self.scale_y)
-            self.draw_8_lines(overlay, mapped_cx, mapped_cy, self.yt_w, self.yt_h, (255, 255, 0))
+    #     # 繪製實機藍色 8 線 (需套用邏輯縮放比)
+    #     mapped_cx, mapped_cy = 0, 0
+    #     if chiaki_pos:
+    #         mapped_cx = int(chiaki_pos[0] * self.scale_x)
+    #         mapped_cy = int(chiaki_pos[1] * self.scale_y)
+    #         self.draw_8_lines(overlay, mapped_cx, mapped_cy, self.yt_w, self.yt_h, (255, 255, 0))
             
-        display = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+    #     display = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
         
-        # 狀態與誤差顯示
-        if video_pos and chiaki_pos:
-            dist = math.hypot(mapped_cx - video_pos[0], mapped_cy - video_pos[1])
-            status_color = (0, 255, 0) if dist < 5 else (0, 0, 255)
-            cv2.putText(display, f"Distance: {int(dist)}px | FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+    #     # 狀態與誤差顯示
+    #     if video_pos and chiaki_pos:
+    #         dist = math.hypot(mapped_cx - video_pos[0], mapped_cy - video_pos[1])
+    #         status_color = (0, 255, 0) if dist < 5 else (0, 0, 255)
+    #         cv2.putText(display, f"Distance: {int(dist)}px | FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
-        return display
+    #     return display
 
     def log_sync_event(self, event_type, details):
         pass
@@ -400,10 +256,10 @@ class AutoPlatinumHand:
         return border_pixels.astype(np.int16)
 
     # ==========================================
-    # 執行循環
+    # 執行循環 (需要對應的修改)
     # ==========================================
 
-    def run_live_sync(self, start_time_sec=153):
+    def run_live_sync(self, start_time_sec=35):
         with sync_playwright() as p:
             # --- Playwright 與影片同步啟動 ---
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
@@ -411,20 +267,33 @@ class AutoPlatinumHand:
             video = page.wait_for_selector("video")
             page.evaluate(f"document.querySelector('video').pause(); document.querySelector('video').currentTime = {start_time_sec};")
             time.sleep(0.5)
+            
             # --- 初始截圖與播放器定位 ---
             self.camera = dxcam.create(output_idx=0, output_color="BGR") 
+            
             full_grab = self.camera.grab()
             while full_grab is None:
                 full_grab = self.camera.grab()
                 time.sleep(0.01)
+                
             self.chaiki_ready(full_grab)
+            
+            # 🎯 啟動背景線程模式 (事件驅動)
             self.camera.start(target_fps=30, video_mode=True)
-            recording, start_tick, prev_time = False, 0, time.time()
+
+            recording = False
+            start_tick = 0
+            prev_time = time.time()
+
             cv2.namedWindow("Platinum Vision")
+            cv2.moveWindow("Platinum Vision", 1920 - self.yt_w - 50, 1080 - self.yt_h - 100)
+
             with torch.no_grad():
                 while True:
+                    # 🎯 阻塞等待新幀
                     full_frame = self.camera.get_latest_frame()
                     if full_frame is None: continue
+                    
                     yt_frame = full_frame[self.yt_y:self.yt_y+self.yt_h, self.yt_x:self.yt_x+self.yt_w]
                     chiaki_frame = full_frame[self.chiaki_y:self.chiaki_y+self.chiaki_h, self.chiaki_x:self.chiaki_x+self.chiaki_w]
                     
@@ -432,34 +301,45 @@ class AutoPlatinumHand:
                     chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
                     
                     curr_time = time.time()
+                    ms = ((cv2.getTickCount() - start_tick) / cv2.getTickFrequency()) * 1000 if recording else 0
                     fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 60
+                    self.last_time_ms = ms
                     prev_time = curr_time
-                    # 1. 影片指針追蹤 (直接傳彩色幀與檔名)
-                    self.last_known_cursor_pos = self.Realtime_cursor_position(
-                        yt_frame, self.last_known_cursor_pos, 'cursor.png'
-                    )
+
+                    # 雙指針辨識
+                    v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
+                    if v_pos: self.last_known_cursor_pos = v_pos
                     
-                    # 2. 實機指針追蹤 (直接傳彩色幀與檔名)
-                    self.chaiki_cursor_pos = self.Realtime_cursor_position(
-                        chiaki_frame, self.chaiki_cursor_pos, 'cursor2.png'
-                    )
+                    c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.70)
+                    if c_pos: self.chaiki_cursor_pos = c_pos
+
                     key = cv2.waitKey(1) & 0xFF
-                    
-                    # 3. 處理追趕邏輯
-                    if recording: 
-                      self.track_video_cursor(self.last_known_cursor_pos, self.chaiki_cursor_pos)
+
+                    if recording:
+                        # --- 後續點擊與隊列處理 (佔位) ---
+                        pass
+
                     if key == ord(' '):
                         if not recording:
-                            page.evaluate("document.querySelector('video').play()")
-                            recording = True
+                            page.evaluate("document.querySelector('video').play();")
+                            start_tick, recording = cv2.getTickCount(), True
+                            print("▶️ 即時對齊模式啟動")
                         else:
-                            page.evaluate("document.querySelector('video').pause()")
+                            page.evaluate("document.querySelector('video').pause();")
                             recording = False
-                            self.release_all_keys()
+                            print("⏸️ 即時對齊模式暫停")
+                    
+                    self.last_full_gray_np = yt_gray.copy()
+                    
+                    # 繪製 HUD (底圖直接使用影片區域)
                     display = self.draw_sync_hud(yt_frame, self.last_known_cursor_pos, self.chaiki_cursor_pos, fps)
                     cv2.imshow("Platinum Vision", display)
+                    
                     if key == ord('q'): break
-            self.camera.stop(); browser.close(); cv2.destroyAllWindows()
+
+            self.camera.stop()
+            browser.close()
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     agent = AutoPlatinumHand("https://www.youtube.com/watch?v=7K_NimshHUI")
