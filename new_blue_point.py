@@ -5,6 +5,8 @@ import time
 import dxcam 
 import torch 
 import win32gui
+import win32api
+import win32con
 from playwright.sync_api import sync_playwright
 
 class AutoPlatinumHand:
@@ -40,6 +42,13 @@ class AutoPlatinumHand:
         self.last_waiting_ms = 0.0
         self.last_time_ms = 0.0
         self.last_full_gray_np = None
+
+        # --- 新增的異步控制變數 ---
+        self.last_click_time = 0.0
+        self.frame_counter = 0
+        self.sync_fail_count = 0
+        self.is_paused_by_sync = False
+        self.key_states = {'up': False, 'down': False, 'left': False, 'right': False}
 
     # ==========================================
     # 區塊 A：初始化與窗口對齊 (Ready 階段)
@@ -127,122 +136,83 @@ class AutoPlatinumHand:
     # 區塊 B：指針追蹤與移動邏輯 (Movement)
     # ==========================================
 
-    # opencv的工作全部給到YOLO去做，不需要一個GUI了，detect_template你看還需要不需要，還是用YOLO的方式重寫一下
     def detect_template(self, gray_frame, template, threshold=0.70):
+        """支持 4 個方向動態旋轉匹配的指針檢測 (臨時替代 YOLO 確保能看見指針)"""
         if template is None or gray_frame is None or gray_frame.size == 0: return None
-        res = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val > threshold:
-            return (max_loc[0] + template.shape[1]//2, max_loc[1] + template.shape[0]//2)
+        
+        best_val = -1
+        best_loc = None
+        best_shape = None
+        
+        templates_4_dirs = [
+            template,
+            cv2.rotate(template, cv2.ROTATE_90_CLOCKWISE),
+            cv2.rotate(template, cv2.ROTATE_180),
+            cv2.rotate(template, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        ]
+        
+        for tpl in templates_4_dirs:
+            res = cv2.matchTemplate(gray_frame, tpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_shape = tpl.shape
+                
+        if best_val > threshold:
+            return (best_loc[0] + best_shape[1]//2, best_loc[1] + best_shape[0]//2)
+            
         return None
 
-    # 用YOLO替代opencv的模板匹配，track_video_cursor和Realtime_cursor_position合併為Realtime_cursor_position
-    # 同時獲取影片和實機的指針位置，現在不需要實時移動
-    # # is_scene_change is_roi_change is_cursor_change click_check need_stop_for_sync execute_click合併
-    # 邏輯現在為 判斷 scene_change  roi_change cursor_change時都做點擊，點擊帶一個實時的影片指針座標進隊列，然後條用move_action或refine_move控制chiaki指針移動到位置點擊
-    # 也就是説現在chiaki的執行會有一定的延遲。
-    # 點擊要有一個最小的間隔時間，避免過於頻繁的點擊（暫時算200ms）
-    # 指針移動時，大概每60幀（2秒）要模糊匹配一下遊戲畫面的邊沿15%的框，判斷兩邊畫面是否同步，如果連續3次匹配不通過，自動暫停影片，讓chaiki那邊繼續執行，知道匹配成功自動繼續
-
-    # def track_video_cursor(self, current_gray, prev_gray):
-    #     pass
-
     def Realtime_cursor_position(self):
+        # 佔位，目前暫時用 detect_template 解決 YOLO 尚未訓練的問題
         pass
 
-    def move_action(self, target_pos):
-        pass
+    def update_key_bg(self, key_str, press):
+        """底層：發送按鍵到 Chiaki"""
+        if not self.chiaki_hwnd: return
+        vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT}
+        vk = vk_map.get(key_str)
+        if self.key_states.get(key_str) != press:
+            if press: win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk, 0)
+            else: win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk, 0)
+            self.key_states[key_str] = press
 
-    def refine_move(self, target_pos):
-        pass
-    
-    def click_action(self, target_pos):
-        pass
+    def release_all_keys(self):
+        for k in ['up', 'down', 'left', 'right']: self.update_key_bg(k, False)
+
+    def move_action(self, dx, dy):
+        """長按大範圍移動"""
+        self.update_key_bg('right', dx > 15)
+        self.update_key_bg('left', dx < -15)
+        self.update_key_bg('down', dy > 15)
+        self.update_key_bg('up', dy < -15)
+
+    def refine_move(self, dx, dy):
+        """短按微調"""
+        self.update_key_bg('right', dx > 2)
+        self.update_key_bg('left', dx < -2)
+        self.update_key_bg('down', dy > 2)
+        self.update_key_bg('up', dy < -2)
+
+    def click_action(self):
+        """執行物理點擊"""
+        win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+        time.sleep(0.05)
+        win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+        print("✅ 實機點擊執行完畢")
 
     # ==========================================
     # 區塊 C：點擊決策與同步暫停 (Logic & Sync)
     # ==========================================
-    # def is_scene_change(self, frame_hash, prev_hash):
-    #     pass
 
-    # def is_roi_change(self, current_roi, prev_roi):
-    #     pass
-
-    # def is_cursor_change(self, frame):
-    #     pass
-
-    # def click_check(self, is_scene, is_roi, is_wait, current_ms):
-    #     pass
-
-    def sync_check(self):
-        pass
-
-    # def execute_click(self, queue_item):
-    #     pass
-
-    # def execute_queue_logic(self):
-    #     pass
-
-    # ==========================================
-    # 區塊 D：視覺化與日誌 (UI & Log)
-    # ==========================================
-
-    # def draw_8_lines(self, overlay, cx, cy, w, h, color):
-    #     """繪製八向百分比輔助線"""
-    #     diag = math.hypot(w, h)
-    #     left_pct = int((cx / w) * 100) if w > 0 else 0
-    #     right_pct = int(((w - cx) / w) * 100) if w > 0 else 0
-    #     top_pct = int((cy / h) * 100) if h > 0 else 0
-    #     bottom_pct = int(((h - cy) / h) * 100) if h > 0 else 0
-    #     tl_pct = int((math.hypot(cx, cy) / diag) * 100) if diag > 0 else 0
-    #     tr_pct = int((math.hypot(w - cx, cy) / diag) * 100) if diag > 0 else 0
-    #     bl_pct = int((math.hypot(cx, h - cy) / diag) * 100) if diag > 0 else 0
-    #     br_pct = int((math.hypot(w - cx, h - cy) / diag) * 100) if diag > 0 else 0
-
-    #     cv2.line(overlay, (cx, cy), (cx, 0), color, 1) 
-    #     cv2.putText(overlay, f"{top_pct}%", (cx + 5, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (cx, h), color, 1) 
-    #     cv2.putText(overlay, f"{bottom_pct}%", (cx + 5, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (0, cy), color, 1) 
-    #     cv2.putText(overlay, f"{left_pct}%", (cx // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (w, cy), color, 1) 
-    #     cv2.putText(overlay, f"{right_pct}%", (cx + (w - cx) // 2, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (0, 0), color, 1) 
-    #     cv2.putText(overlay, f"{tl_pct}%", (cx // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (w, 0), color, 1) 
-    #     cv2.putText(overlay, f"{tr_pct}%", (cx + (w - cx) // 2, cy // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (0, h), color, 1) 
-    #     cv2.putText(overlay, f"{bl_pct}%", (cx // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    #     cv2.line(overlay, (cx, cy), (w, h), color, 1) 
-    #     cv2.putText(overlay, f"{br_pct}%", (cx + (w - cx) // 2, cy + (h - cy) // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-
-    # def draw_sync_hud(self, frame, video_pos, chiaki_pos, fps):
-    #     """獨立繪製 GUI：整合輔助線繪製與縮放邏輯"""
-    #     overlay = frame.copy()
-        
-    #     # 繪製影片橘色 8 線
-    #     if video_pos:
-    #         self.draw_8_lines(overlay, video_pos[0], video_pos[1], self.yt_w, self.yt_h, (0, 165, 255))
-        
-    #     # 繪製實機藍色 8 線 (需套用邏輯縮放比)
-    #     mapped_cx, mapped_cy = 0, 0
-    #     if chiaki_pos:
-    #         mapped_cx = int(chiaki_pos[0] * self.scale_x)
-    #         mapped_cy = int(chiaki_pos[1] * self.scale_y)
-    #         self.draw_8_lines(overlay, mapped_cx, mapped_cy, self.yt_w, self.yt_h, (255, 255, 0))
-            
-    #     display = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
-        
-    #     # 狀態與誤差顯示
-    #     if video_pos and chiaki_pos:
-    #         dist = math.hypot(mapped_cx - video_pos[0], mapped_cy - video_pos[1])
-    #         status_color = (0, 255, 0) if dist < 5 else (0, 0, 255)
-    #         cv2.putText(display, f"Distance: {int(dist)}px | FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-
-    #     return display
-
-    def log_sync_event(self, event_type, details):
-        pass
+    def sync_check(self, yt_gray, chiaki_gray):
+        """每 60 幀模糊匹配邊沿 15% 確保畫面同步"""
+        yt_hash = self.get_sparse_hash(yt_gray)
+        ck_hash = self.get_sparse_hash(cv2.resize(chiaki_gray, (yt_gray.shape[1], yt_gray.shape[0])))
+        diff = np.mean(cv2.absdiff(yt_hash, ck_hash))
+        return diff < 60  # 放寬至 60 避免誤判
 
     def get_sparse_hash(self, gray_frame):
         h, w = gray_frame.shape
@@ -256,7 +226,7 @@ class AutoPlatinumHand:
         return border_pixels.astype(np.int16)
 
     # ==========================================
-    # 執行循環 (需要對應的修改)
+    # 執行循環
     # ==========================================
 
     def run_live_sync(self, start_time_sec=35):
@@ -284,9 +254,9 @@ class AutoPlatinumHand:
             recording = False
             start_tick = 0
             prev_time = time.time()
+            last_print_time = time.time() # 新增：用於控制每秒打印頻率
 
-            cv2.namedWindow("Platinum Vision")
-            cv2.moveWindow("Platinum Vision", 1920 - self.yt_w - 50, 1080 - self.yt_h - 100)
+            print("🚀 系統啟動：[Space] 開始/暫停 | [Q] 退出")
 
             with torch.no_grad():
                 while True:
@@ -301,41 +271,110 @@ class AutoPlatinumHand:
                     chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
                     
                     curr_time = time.time()
-                    ms = ((cv2.getTickCount() - start_tick) / cv2.getTickFrequency()) * 1000 if recording else 0
-                    fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 60
-                    self.last_time_ms = ms
-                    prev_time = curr_time
 
-                    # 雙指針辨識
+                    # 雙指針辨識 (使用 4 向檢測函數)
                     v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
-                    if v_pos: self.last_known_cursor_pos = v_pos
-                    
                     c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.70)
+                    
+                    if v_pos: self.last_known_cursor_pos = v_pos
                     if c_pos: self.chaiki_cursor_pos = c_pos
 
-                    key = cv2.waitKey(1) & 0xFF
+                    # ⏱️ 每秒打印一次座標狀態
+                    if curr_time - last_print_time >= 1.0:
+                        print(f"⏱️ [座標即時監控] 影片目標: {self.last_known_cursor_pos} | 實機位置: {self.chaiki_cursor_pos}")
+                        last_print_time = curr_time
 
                     if recording:
-                        # --- 後續點擊與隊列處理 (佔位) ---
-                        pass
+                        # --- A. 事件檢測 (場景變化 & ROI 變化) ---
+                        scene_changed = False
+                        roi_changed = False
+                        
+                        if self.last_full_gray_np is not None:
+                            # 檢測 Scene Change (放寬閾值到 35 防誤判)
+                            yt_hash = self.get_sparse_hash(yt_gray)
+                            prev_hash = self.get_sparse_hash(self.last_full_gray_np)
+                            if np.mean(cv2.absdiff(yt_hash, prev_hash)) > 35: 
+                                scene_changed = True
 
-                    if key == ord(' '):
-                        if not recording:
-                            page.evaluate("document.querySelector('video').play();")
-                            start_tick, recording = cv2.getTickCount(), True
-                            print("▶️ 即時對齊模式啟動")
+                            # 檢測 ROI Change
+                            if v_pos:
+                                cx, cy = int(v_pos[0]), int(v_pos[1])
+                                h, w = yt_gray.shape
+                                x1, y1 = max(0, cx-40), max(0, cy-40)
+                                x2, y2 = min(w, cx+40), min(h, cy+40)
+                                curr_roi = yt_gray[y1:y2, x1:x2].copy()
+                                prev_roi = self.last_full_gray_np[y1:y2, x1:x2].copy()
+                                
+                                rh, rw = curr_roi.shape
+                                if rh > 20 and rw > 20:
+                                    curr_roi[rh//2-10:rh//2+10, rw//2-10:rw//2+10] = 0
+                                    prev_roi[rh//2-10:rh//2+10, rw//2-10:rw//2+10] = 0
+                                if np.mean(cv2.absdiff(curr_roi, prev_roi)) > 15:
+                                    roi_changed = True
+
+                        # --- B. 隊列注入 (事件驅動入隊) ---
+                        # 觸發條件：點擊間隔 > 200ms 且 (ROI背景變化 或 場景切換)
+                        if (curr_time - self.last_click_time > 0.2) and v_pos:
+                            if roi_changed or scene_changed:
+                                if not any(q['pos'] == v_pos for q in self.queue):
+                                    self.queue.append({'pos': v_pos})
+                                    self.last_click_time = curr_time
+                                    event_name = "場景切換" if scene_changed else "ROI變化"
+                                    print(f"📥 點擊事件入隊 ({event_name})，目標: {v_pos}")
+
+                        # --- C. 隊列延遲執行 (Chiaki 移動與點擊) ---
+                        if self.queue:
+                            target_v_pos = self.queue[0]['pos']
+                            if self.chaiki_cursor_pos:
+                                tx = target_v_pos[0] / self.scale_x
+                                ty = target_v_pos[1] / self.scale_y
+                                dx = tx - self.chaiki_cursor_pos[0]
+                                dy = ty - self.chaiki_cursor_pos[1]
+                                dist = math.hypot(dx, dy)
+
+                                if dist <= 8:
+                                    self.release_all_keys()
+                                    self.click_action()
+                                    self.queue.pop(0)
+                                elif dist > 50:
+                                    self.move_action(dx, dy)
+                                else:
+                                    self.refine_move(dx, dy)
+                            else:
+                                # Chiaki 指針短暫丟失 -> 什麼都不做，等待下一幀重新識別
+                                self.release_all_keys()
                         else:
-                            page.evaluate("document.querySelector('video').pause();")
-                            recording = False
-                            print("⏸️ 即時對齊模式暫停")
-                    
+                            self.release_all_keys()
+
+                        # --- D. 每 60 幀邊沿 Sync Check ---
+                        self.frame_counter += 1
+                        if self.frame_counter >= 60:
+                            self.frame_counter = 0
+                            is_synced = self.sync_check(yt_gray, chiaki_gray)
+                            
+                            if not is_synced:
+                                self.sync_fail_count += 1
+                                if self.sync_fail_count >= 3 and not self.is_paused_by_sync:
+                                    page.evaluate("document.querySelector('video').pause();")
+                                    self.is_paused_by_sync = True
+                                    print("⏸️ 畫面不同步，自動暫停影片")
+                            else:
+                                self.sync_fail_count = 0
+                                if self.is_paused_by_sync:
+                                    page.evaluate("document.querySelector('video').play();")
+                                    self.is_paused_by_sync = False
+                                    print("▶️ 畫面已同步，自動恢復播放")
+
                     self.last_full_gray_np = yt_gray.copy()
+
+                    key = cv2.waitKey(1) & 0xFF
                     
-                    # 繪製 HUD (底圖直接使用影片區域)
-                    display = self.draw_sync_hud(yt_frame, self.last_known_cursor_pos, self.chaiki_cursor_pos, fps)
-                    cv2.imshow("Platinum Vision", display)
-                    
-                    if key == ord('q'): break
+                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000: break
+                    if win32api.GetAsyncKeyState(win32con.VK_SPACE) & 0x01:
+                        recording = not recording
+                        page.evaluate(f"document.querySelector('video').{'play' if recording else 'pause'}()")
+                        if not recording: self.release_all_keys()
+                        print(f"狀態切換: {'執行中' if recording else '暫停'}")
 
             self.camera.stop()
             browser.close()
