@@ -272,121 +272,111 @@ class AutoPlatinumHand:
         prev_hash = self.get_sparse_hash(self.last_full_gray_np)
         return np.mean(cv2.absdiff(curr_hash, prev_hash)) > 35
 
-    def is_scene_changed(self, current_gray, last_gray, cursor_x, cursor_y, mask_size=100):
+    def is_scene_changed(self, current_gray, last_gray, cursor_x, cursor_y, is_sync_mode=False):
         """
-        💡 採用全局背景對比：將游標周圍 mask_size 大小的區域塗黑後，對比兩幀差異。
-        徹底防範游標閃爍造成的誤判。
+        💡 雙軌判定：局部幾何特徵 (Canny) OR 全局結構分佈 (32x32)。
         """
-        if current_gray is None or last_gray is None:
-            return False
-            
-        curr_masked = current_gray.copy()
-        last_masked = last_gray.copy()
-        h, w = curr_masked.shape
+        if current_gray is None or last_gray is None: return False
         
-        # 計算遮罩的邊界，防止超出畫面
-        x1 = max(0, int(cursor_x - mask_size/2))
-        x2 = min(w, int(cursor_x + mask_size/2))
-        y1 = max(0, int(cursor_y - mask_size/2))
-        y2 = min(h, int(cursor_y + mask_size/2))
+        # 1. 中值濾波：濾除馬賽克畫面的壓縮噪點，保留 2px 線條細節
+        curr_b = cv2.medianBlur(current_gray, 3)
+        last_b = cv2.medianBlur(last_gray, 3)
         
-        # 將游標區域塗黑
-        curr_masked[y1:y2, x1:x2] = 0
-        last_masked[y1:y2, x1:x2] = 0
+        h, w = curr_b.shape
+        # 2. 局部 1/3 區域提取
+        rw, rh = w // 3, h // 3
+        rx1, ry1 = max(0, int(cursor_x - rw//2)), max(0, int(cursor_y - rh//2))
+        rx2, ry2 = min(w, rx1 + rw), min(h, ry1 + rh)
         
-        # 計算差異
-        diff = cv2.absdiff(curr_masked, last_masked)
-        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-        changed_pixels = cv2.countNonZero(thresh)
-        total_pixels = w * h - ((x2 - x1) * (y2 - y1))
+        # 局部幾何評分 (Canny Edge) - 排除指針中心 60px 避免自干擾
+        curr_l_edge = cv2.Canny(curr_b[ry1:ry2, rx1:rx2], 50, 150)
+        last_l_edge = cv2.Canny(last_b[ry1:ry2, rx1:rx2], 50, 150)
         
-        if total_pixels <= 0: return False
-        change_ratio = changed_pixels / total_pixels
+        # 3. 全局結構評分 (下採樣 32x32) - 徹底無視拉伸與微小色差
+        curr_s = cv2.resize(curr_b, (32, 32))
+        last_s = cv2.resize(last_b, (32, 32))
         
-        return change_ratio > 0.05
+        # 4. 計算得分
+        local_score = cv2.countNonZero(cv2.absdiff(curr_l_edge, last_l_edge)) / (rw * rh) if (rw*rh)>0 else 0
+        global_score = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
+        
+        # 💡 判定邏輯：任意條件達成即通過
+        # 💡 is_scene_changed 內部的最後判定
+        if is_sync_mode:
+            # 同步模式：只要全局或局部有一邊是對上的，就算同步
+            # 我們反過來想：只有當 (全局大改) 且 (局部也大改) 時，才算「不同步」
+            return global_score > 0.08 and local_score > 0.10
+        else:
+            # 觸發模式：任意一處有動靜就算變化
+            return local_score > 0.045 or global_score > 0.05
 
     def sync_check(self, yt_gray, chiaki_gray):
-        """模糊匹配遊戲邊沿 15%，判斷是否同步"""
-        yt_hash = self.get_sparse_hash(yt_gray)
-        ck_hash = self.get_sparse_hash(cv2.resize(chiaki_gray, (yt_gray.shape[1], yt_gray.shape[0])))
-        return np.mean(cv2.absdiff(yt_hash, ck_hash)) < 25  # 🌟 縮緊同步閾值，不同步立刻抓
+        """💡 職能解耦：僅用於判斷是否暫停影片。"""
+        if yt_gray is None or chiaki_gray is None: return True
+        ck_res = cv2.resize(chiaki_gray, (self.yt_w, self.yt_h))
+        # 僅使用全局判定
+        is_different = self.is_scene_changed(yt_gray, ck_res, 0, 0, is_sync_mode=True)
+        return not is_different
     
     def enqueue_video_pos(self, pos):
         """將目標座標加入隊列，避免連續幀塞入完全相同的座標"""
         if not self.queue or self.queue[-1] != pos:
             self.queue.append(pos)
 
-    def process_queue(self, chiaki_gray=None):
-        """處理佇列：使用實機自身畫面比對來驗證點擊是否有效"""
-        if self.queue:
-            target_pos = self.queue[0]
-            current_t = time.time()
-            
-            if not hasattr(self, 'click_validating'):
-                self.click_validating = False
-                self.val_start_time = 0.0
-                self.click_retry_count = 0
-
-            if self.click_validating:
-                if current_t - self.val_start_time > 1.5:
-                    # 💡 拋棄 sync_fail_count，改用 Chiaki 自己點擊前後的畫面做比對
-                    if chiaki_gray is not None and hasattr(self, 'chiaki_gray_before_click'):
-                        ck_abs_x = int(self.chaiki_cursor_pos[0] * self.chiaki_w) if self.chaiki_cursor_pos else 0
-                        ck_abs_y = int(self.chaiki_cursor_pos[1] * self.chiaki_h) if self.chaiki_cursor_pos else 0
-                        
-                        chiaki_reacted = self.is_scene_changed(chiaki_gray, self.chiaki_gray_before_click, ck_abs_x, ck_abs_y)
-                        
-                        if not chiaki_reacted:
-                            self.click_retry_count += 1
-                            if self.click_retry_count <= 3:
-                                import random
-                                offset_x = random.uniform(-0.03, 0.03)
-                                offset_y = random.uniform(-0.03, 0.03)
-                                self.queue[0] = (target_pos[0] + offset_x, target_pos[1] + offset_y)
-                                print(f"🔄 [Validation Failed] 實機無反應！微調目標 -> 新座標: {self.queue[0]}")
-                            else:
-                                print("⚠️ [Validation Failed] 點擊 3 次實機均無反應，強制放棄任務。")
-                                self.queue.pop(0)
-                                self.click_retry_count = 0
-                            
-                            self.click_validating = False
-                        else:
-                            print("✨ [Validation Success] 實機畫面成功切換！任務完成。")
-                            self.queue.pop(0)
-                            self.click_validating = False
-                            self.click_retry_count = 0
-                            
-                            # ✨ 防抖冷卻：成功切換後，強制忽略接下來 1.5 秒內的影片變動
-                            self.ignore_tasks_until = current_t + 1.5
-                    return
-                else:
-                    self.release_all_keys()
-                return
-
-            # --- 正常的移動與點擊邏輯 ---
-            if self.chaiki_cursor_pos:
-                dist = math.hypot(target_pos[0]-self.chaiki_cursor_pos[0], 
-                                  target_pos[1]-self.chaiki_cursor_pos[1])
-                
-                is_arrived = dist < 0.015
-                
-                if is_arrived:
-                    print(f"🎯 [Queue] 到達目標！(誤差: {dist:.3f}) 執行點擊...")
-                    self.click_action()
-                    self.click_validating = True
-                    self.val_start_time = current_t
-                    # 記錄點擊瞬間的實機畫面
-                    if chiaki_gray is not None:
-                        self.chiaki_gray_before_click = chiaki_gray.copy()
-                else:
-                    self.move_action(self.chaiki_cursor_pos, target_pos)
-            else:
-                self.release_all_keys()
-        else:
+    def process_queue(self, chiaki_gray=None, yt_gray=None):
+        """
+        💡 職能解耦版：
+        1. 沒任務時 Roaming 跟隨。
+        2. 有任務時盯死 queue[0]，物理到位才點擊。
+        3. 點擊完成後 0.5s 自動銷毀，不看 sync_check。
+        """
+        if not self.queue:
             if self.chaiki_cursor_pos and self.last_known_cursor_pos:
                 self.move_action(self.chaiki_cursor_pos, self.last_known_cursor_pos)
             else:
                 self.release_all_keys()
+            return
+
+        # 永遠只處理排在最前面的任務
+        target_pos = self.queue[0]
+        current_t = time.time()
+        
+        # 獲取實機與目標的物理距離
+        dist = math.hypot(target_pos[0]-self.chaiki_cursor_pos[0], target_pos[1]-self.chaiki_cursor_pos[1])
+
+        # --- 狀態 A：等待點擊動作完成後的物理冷卻 ---
+        if getattr(self, 'click_validating', False):
+            wait_time = current_t - self.val_start_time
+            # 點擊完畢給予 0.5s 讓模擬器反應，隨即彈出任務
+            if wait_time > 0.5:
+                print(f"✅ [Task Finished] 執行完畢，彈出任務: {target_pos} | 剩餘: {len(self.queue)-1}")
+                self.queue.pop(0) 
+                self.click_validating = False
+                self.ignore_tasks_until = current_t + 0.1 # 極短冷卻防止粘連
+            return
+
+        # --- 狀態 B：執行移動與點擊決策 ---
+        if dist < 0.018:
+            # 💡 只有影片穩定時才准點擊，防止點在動畫中途
+            if getattr(self, 'video_is_stable', True):
+                print(f"🔥 [EXECUTE CLICK] 🔥")
+                print(f"   - 任務目標 (Target): {target_pos}")
+                print(f"   - 實機位置 (Actual): {self.chaiki_cursor_pos}")
+                print(f"   - 物理誤差 (Dist): {dist:.4f}")
+                
+                self.click_action()
+                self.click_validating = True
+                self.val_start_time = current_t
+            else:
+                # 影片還在閃爍/動畫中，原地待命
+                self.release_all_keys()
+        else:
+            # 距離還遠，繼續移動。
+            # 這裡打印移動目標，確保它沒有「變心」
+            if not hasattr(self, '_last_move_log') or current_t - self._last_move_log > 1.0:
+                print(f"🚚 [Moving] 正在前往任務點: {target_pos} | 當前距離: {dist:.4f}")
+                self._last_move_log = current_t
+            self.move_action(self.chaiki_cursor_pos, target_pos)
 
     def get_sparse_hash(self, gray_frame):
         h, w = gray_frame.shape
@@ -487,8 +477,11 @@ class AutoPlatinumHand:
                 page.add_style_tag(content='.ytp-chrome-bottom, .ytp-chrome-top, .ytp-gradient-bottom, .ytp-gradient-top, .ytp-watermark { display: none !important; }')
                 print("▶️ 影片自動播放，並已屏蔽 YouTube UI 干擾，進入全自動模式！")
 
+                # 💡 在啟動播放後加入開場保護計數
+                self.observation_frames = 0
+                self.prev_intent_pos = None  # 🌟 新增：用於記錄點擊發生前的意圖座標
+
                 while True:
-                    # 🎯 阻塞等待新幀
                     full_frame = self.camera.get_latest_frame()
                     if full_frame is None: continue
                     
@@ -497,121 +490,104 @@ class AutoPlatinumHand:
                     
                     yt_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY)
                     chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
+
+                    if not hasattr(self, 'reference_gray') or self.reference_gray is None:
+                        self.reference_gray = yt_gray.copy()
+                        self.ref_frame_timer = 0
                     
-                    # 1. YOLO 推論
+                    # 🌟 核心修正：在更新座標前，備份上一幀正在追趕的目標
+                    # 這是為了落實「點擊回饋」約定：場景變了，兇手一定是「剛才追的地方」
+                    if self.last_known_cursor_pos:
+                        self.prev_intent_pos = (float(self.last_known_cursor_pos[0]), float(self.last_known_cursor_pos[1]))
+
+                    # 執行視覺偵測
                     yt_rel_pos, yt_cls, yt_abs_pos = self.Realtime_cursor_position(yt_frame)
                     ck_rel_pos, ck_cls, ck_abs_pos = self.Realtime_cursor_position(chiaki_frame)
 
-                    # **注意：使用 is not None 判斷，避免 (0.0,0.0) 被丟掉**
+                    # 開場跳幀保護
+                    if self.observation_frames < 10:
+                        self.observation_frames += 1
+                        self.release_all_keys()
+                        continue
+
+                    # --- 決策邏輯 ---
+                    current_t = time.time()
+                    is_locked = getattr(self, 'click_validating', False) or (current_t < getattr(self, 'ignore_tasks_until', 0))
+
+                    scene_changed = False
+                    if not is_locked:
+                        # 使用保底座標防止 YOLO 丟失時報錯
+                        sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
+                        sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
+                        
+                        try:
+                            scene_changed = self.is_scene_changed(yt_gray, self.reference_gray, sx, sy)
+                        except:
+                            scene_changed = False
+                        
+                        # 影片穩定性監控 (3 幀)
+                        if not hasattr(self, 'video_stable_frames'): self.video_stable_frames = 0
+                        if scene_changed:
+                            self.video_stable_frames = 0
+                            self.video_is_stable = False
+                            self.reference_gray = yt_gray.copy()
+                            self.ref_frame_timer = 0
+                        else:
+                            self.video_stable_frames += 1
+                            if self.video_stable_frames >= 3: self.video_is_stable = True
+                            self.ref_frame_timer += 1
+                            if self.ref_frame_timer >= 30:
+                                self.reference_gray = yt_gray.copy()
+                                self.ref_frame_timer = 0
+
+                    # 更新影片與實機位置快照
                     if yt_rel_pos is not None:
-                        self.last_video_rel = yt_rel_pos
-                        self.last_known_cursor_pos = yt_rel_pos
+                        self.last_video_rel, self.last_known_cursor_pos = yt_rel_pos, yt_rel_pos
+                    else:
+                        if not self.queue: self.release_all_keys()
 
-                        # 💡 捕捉最後 Hover 位置
-                        if not hasattr(self, 'hover_frame_count'):
-                            self.hover_frame_count = 0
-                            self.last_hover_pos = yt_rel_pos
-                            self.last_yt_rel_pos_for_hover = yt_rel_pos
-
-                        if self.last_yt_rel_pos_for_hover is not None:
-                            dist = math.hypot(yt_rel_pos[0] - self.last_yt_rel_pos_for_hover[0],
-                                              yt_rel_pos[1] - self.last_yt_rel_pos_for_hover[1])
-                            if dist < 0.005:
-                                self.hover_frame_count += 1
-                                if self.hover_frame_count >= 5:
-                                    self.last_hover_pos = yt_rel_pos
-                            else:
-                                self.hover_frame_count = 0
-                        self.last_yt_rel_pos_for_hover = yt_rel_pos
-
-                    if ck_rel_pos is not None:
+                    if ck_rel_pos is not None: 
                         self.chaiki_cursor_pos = ck_rel_pos
 
-                    if recording:
-                        current_t = time.time()
-                        # 💡 隊列鎖：驗證期間或冷卻期內，徹底鎖死，無視影片任何變動
-                        is_validating = getattr(self, 'click_validating', False)
-                        is_cooling_down = current_t < getattr(self, 'ignore_tasks_until', 0)
-                        is_locked = is_validating or is_cooling_down
-
-                        if yt_rel_pos is not None and not is_locked:
-                            # 呼叫全局遮罩對比
-                            scene_changed = self.is_scene_changed(yt_gray, self.last_full_gray_np, 
-                                                                  yt_abs_pos[0] if yt_abs_pos else 0,
-                                                                  yt_abs_pos[1] if yt_abs_pos else 0)
-                            
-                            if self.last_yt_cls is None:
-                                cursor_changed = False
-                                scene_changed = False 
-                            else:
-                                cursor_changed = (yt_cls != self.last_yt_cls and yt_cls in ('Hold', 'Keep'))
-                                
-                            self.last_yt_cls = yt_cls
-
-                            # ==========================================
-                            # 💡 連續幀場景變化狀態機 & 2 秒超時防護
-                            # ==========================================
-                            if not hasattr(self, 'video_scene_unstable'):
-                                self.video_scene_unstable = False
-                                self.unstable_start_time = 0.0
-
-                            trigger_click = False
-
-                            if scene_changed:
-                                if not self.video_scene_unstable:
-                                    self.video_scene_unstable = True
-                                    self.unstable_start_time = current_t
-                                    trigger_click = True
-                                else:
-                                    if current_t - self.unstable_start_time > 2.0:
-                                        self.video_scene_unstable = False
-                            else:
-                                if self.video_scene_unstable:
-                                    self.video_scene_unstable = False
-
-                            if cursor_changed:
-                                trigger_click = True
-                            # ==========================================
-
-                            if trigger_click:
-                                self.pending_click = True
-                                print(f'📥 point click pending (Scene_transition_start: {scene_changed}, Cursor_changed: {cursor_changed})')
-
-                        if self.pending_click and not is_locked:
-                            # 使用 Hover 位置作為目標，免疫過場動畫期間的手把滑動
-                            click_target = getattr(self, 'last_hover_pos', self.last_known_cursor_pos)
-                            print(f"🎯 [Hover Target] 鎖定最後停留位置: {click_target} (排除過場偏移)")
-                            self.enqueue_video_pos(click_target)
-                            
-                            self.pending_click = False
-
-                        # 💡 傳入 chiaki_gray 進行實機驗證
-                        self.process_queue(chiaki_gray)
-
-                    # 4. 自動同步檢查
-                    self.frame_counter += 1
-                    if self.frame_counter >= 30:
-                        self.frame_counter = 0
-                        is_synced = self.sync_check(yt_gray, chiaki_gray)
+                    # --- 任務排隊邏輯 (關鍵修正) ---
+                    # --- 任務入隊邏輯 ---
+                    if recording and not is_locked:
+                        trigger = scene_changed or (yt_rel_pos and self.last_yt_cls and yt_cls != self.last_yt_cls and yt_cls in ('Hold', 'Keep'))
                         
-                        if not is_synced:
+                        if trigger:
+                            # 🌟 落實回饋約定：使用 prev_intent_pos
+                            priority_target = self.prev_intent_pos if self.prev_intent_pos else self.last_known_cursor_pos
+                            
+                            if priority_target:
+                                new_task = (float(priority_target[0]), float(priority_target[1]))
+                                # 嚴格排隊，不准覆蓋。同一個點 4% 距離內不重複入隊
+                                if not self.queue or math.hypot(new_task[0]-self.queue[-1][0], new_task[1]-self.queue[-1][1]) > 0.04:
+                                    self.queue.append(new_task)
+                                    print(f"📥 [New Task] {new_task} 加入隊列 | 總數: {len(self.queue)}")
+                        
+                        self.last_yt_cls = yt_cls
+
+                    # 執行任務處理 (移動/點擊/驗證)
+                    self.process_queue(chiaki_gray, yt_gray)
+
+                    # --- 定期同步檢查 ---
+                    self.frame_counter += 1
+                    if self.frame_counter >= 45:
+                        self.frame_counter = 0
+                        if not is_locked and not self.sync_check(yt_gray, chiaki_gray):
                             self.sync_fail_count += 1
                             if self.sync_fail_count >= 3 and not self.is_paused_by_sync:
                                 page.evaluate("document.querySelector('video').pause();")
                                 self.is_paused_by_sync = True
-                                self.release_all_keys()
-                                print("⏸️ 畫面不同步持續約 3 秒，自動暫停影片等待實機...")
+                                print("⏸️ 畫面不同步，暫停影片...")
                         else:
                             self.sync_fail_count = 0
                             if self.is_paused_by_sync:
                                 page.evaluate("document.querySelector('video').play();")
                                 self.is_paused_by_sync = False
-                                print("▶️ 畫面已重新對齊，自動恢復播放！")
+                                print("▶️ 重新對齊，恢復播放！")
 
-                    self.last_full_gray_np = yt_gray.copy()
-                    
-                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000:
-                        print("🛑 收到 Q 鍵，系統安全退出...")
+                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000: 
                         break
 
             self.camera.stop()
