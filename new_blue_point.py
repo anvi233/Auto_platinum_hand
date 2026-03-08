@@ -3,61 +3,59 @@ import numpy as np
 import math
 import time
 import dxcam 
-import torch 
 import win32gui
 import win32api
 import win32con
-from playwright.sync_api import sync_playwright
+from ultralytics import YOLO
 
 class AutoPlatinumHand:
-    def __init__(self, youtube_url, cursor_path='cursor.png', waiting_path='waiting.png', chiaki_cursor_path='cursor2.png'):
-        # --- 設備與資源初始化 ---
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.cursor_tpl = cv2.imread(cursor_path, 0)
-        self.chiaki_cursor_tpl = cv2.imread(chiaki_cursor_path, 0)
-        self.waiting_tpl = cv2.imread(waiting_path, 0)
+    def __init__(self, model_path=r'E:\Myst_Project\v3_final_1900\weights\best.pt'):
+        # --- 視覺引擎初始化 ---
+        print("🧠 載入 YOLO V3 視覺引擎...")
+        self.model = YOLO(model_path)
+        self.camera = dxcam.create(output_idx=0, output_color="BGR")
         
-        # --- 狀態與隊列 ---
-        self.youtube_url = youtube_url
-        self.state = "INIT"  # HOVER, MOVE, WAIT
-        self.queue = []      # 任務隊列：存放 hover, click, scene_change_check
-        self.click_count = 0
-        self.scene_change_count = 0
-        
-        # --- 座標追蹤變量 (1:1 映射) ---
-        self.last_known_cursor_pos = None  # 影片指針位置
-        self.chaiki_cursor_pos = None      # Chaiki 實機指針位置
-        
-        # --- 窗口同步與偏移 ---
-        self.camera = None
+        # --- 狀態與窗口 ---
+        self.state = "INIT"
         self.chiaki_hwnd = None
+        self.yt_locked_roi = None
+        self.ck_locked_roi = None
         
-        # 絕對座標儲存
-        self.yt_x, self.yt_y, self.yt_w, self.yt_h = 0, 0, 0, 0
-        self.chiaki_x, self.chiaki_y, self.chiaki_w, self.chiaki_h = 0, 0, 0, 0
-        self.scale_x = 1.0
-        self.scale_y = 1.0
-        
-        # --- 暫停與免責期邏輯 ---
-        self.last_waiting_ms = 0.0
-        self.last_time_ms = 0.0
-        self.last_full_gray_np = None
-
-        # --- 新增的異步控制變數 ---
-        self.last_click_time = 0.0
-        self.frame_counter = 0
-        self.sync_fail_count = 0
-        self.is_paused_by_sync = False
+        # 鍵盤狀態追蹤，防止重複發送
         self.key_states = {'up': False, 'down': False, 'left': False, 'right': False}
 
     # ==========================================
-    # 區塊 A：初始化與窗口對齊 (Ready 階段)
+    # 區塊 A：畫面提取與 YOLO 推理
     # ==========================================
 
+    def get_window_client_area(self, keyword):
+        """獲取軟體內部渲染區域"""
+        hwnds = []
+        def enum_cb(hwnd, param):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd).lower()
+                if keyword in title and "powershell" not in title and "code" not in title:
+                    param.append(hwnd)
+        win32gui.EnumWindows(enum_cb, hwnds)
+        
+        if not hwnds: return None
+            
+        target_hwnd = hwnds[0]
+        if "chiaki" in keyword: self.chiaki_hwnd = target_hwnd
+            
+        rect = win32gui.GetClientRect(target_hwnd)
+        left, top = win32gui.ClientToScreen(target_hwnd, (rect[0], rect[1]))
+        right, bottom = win32gui.ClientToScreen(target_hwnd, (rect[2], rect[3]))
+        
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0: return None
+        return left, top, w, h
+
     def get_pure_game_scene(self, bgr_image):
-        """核心過濾：找尋畫面中最大面積的彩色長方形"""
+        """自動切除瀏覽器UI與影片黑邊"""
         gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-        _, dark_mask = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY_INV)
+        _, dark_mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY_INV)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         dark_mask_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
         
@@ -68,7 +66,7 @@ class AutoPlatinumHand:
         cx, cy, cw, ch = cv2.boundingRect(largest_dark_cnt)
         
         container_roi_gray = gray[cy:cy+ch, cx:cx+cw]
-        _, game_mask = cv2.threshold(container_roi_gray, 15, 255, cv2.THRESH_BINARY)
+        _, game_mask = cv2.threshold(container_roi_gray, 20, 255, cv2.THRESH_BINARY)
         game_mask = cv2.morphologyEx(game_mask, cv2.MORPH_CLOSE, kernel)
         game_mask = cv2.morphologyEx(game_mask, cv2.MORPH_OPEN, kernel)
         
@@ -80,94 +78,47 @@ class AutoPlatinumHand:
         
         return cx + gx, cy + gy, gw, gh
 
-    def get_absolute_game_rect(self, keyword, full_screen_frame):
-        """抓取目標視窗並裁切黑邊，返回絕對座標"""
-        hwnds = []
-        def enum_cb(hwnd, param):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd).lower()
-                if keyword in title and "powershell" not in title:
-                    param.append(hwnd)
-        win32gui.EnumWindows(enum_cb, hwnds)
-        
-        if not hwnds: return None
+    def process_target_yolo(self, full_frame, keyword, locked_roi):
+        """處理單一目標，返回歸一化座標 (0~1) 和新的鎖定 ROI"""
+        rect = self.get_window_client_area(keyword)
+        if rect is None:
+            return None, None, None, locked_roi
             
-        hwnd = hwnds[0]
-        if "chiaki" in keyword: self.chiaki_hwnd = hwnd
-        rect = win32gui.GetWindowRect(hwnd)
+        tx, ty, tw, th = rect
+        window_img = full_frame[ty:ty+th, tx:tx+tw]
         
-        sh, sw = full_screen_frame.shape[:2]
-        x1, y1, x2, y2 = max(0, rect[0]), max(0, rect[1]), min(sw, rect[2]), min(sh, rect[3])
-        
-        if x1 >= x2 or y1 >= y2: return None
-        
-        window_img = full_screen_frame[y1:y2, x1:x2]
-        ix, iy, iw, ih = self.get_pure_game_scene(window_img)
-        
-        return x1 + ix, y1 + iy, iw, ih
-
-    def auto_align_chiaki(self, full_grab):
-        """鎖定 Chiaki 窗口並提取遊戲 ROI"""
-        chiaki_rect = self.get_absolute_game_rect("chiaki", full_grab)
-        if chiaki_rect:
-            self.chiaki_x, self.chiaki_y, self.chiaki_w, self.chiaki_h = chiaki_rect
-            print(f"✅ 實機精確鎖定: ({self.chiaki_x}, {self.chiaki_y}), 尺寸 {self.chiaki_w}x{self.chiaki_h}")
-            return True
-        print("❌ 找不到 Chiaki 視窗！")
-        return False
-
-    def chaiki_ready(self, full_grab):
-        """完成 1:1 強制對齊計算"""
-        yt_rect = self.get_absolute_game_rect("youtube", full_grab)
-        if yt_rect:
-            self.yt_x, self.yt_y, self.yt_w, self.yt_h = yt_rect
-            print(f"🎯 影片精確鎖定: ({self.yt_x}, {self.yt_y}), 尺寸 {self.yt_w}x{self.yt_h}")
+        if locked_roi is None:
+            ix, iy, iw, ih = self.get_pure_game_scene(window_img)
+            if iw > 200 and ih > 200:
+                locked_roi = (ix, iy, iw, ih)
+                print(f"🔒 [{keyword}] 裁切鎖定: {iw}x{ih}")
+            else:
+                return None, None, None, locked_roi
         else:
-            print("❌ 找不到 YouTube 視窗！")
+            ix, iy, iw, ih = locked_roi
 
-        self.auto_align_chiaki(full_grab)
-
-        if self.yt_w > 0 and self.chiaki_w > 0:
-            self.scale_x = self.yt_w / self.chiaki_w
-            self.scale_y = self.yt_h / self.chiaki_h
-            print(f"⚖️ 邏輯縮放比 - X軸: {self.scale_x:.4f}, Y軸: {self.scale_y:.4f}")
+        pure_game_img = window_img[iy:iy+ih, ix:ix+iw]
+        
+        # YOLO 推理
+        results = self.model.predict(pure_game_img, conf=0.6, verbose=False)
+        
+        if len(results[0].boxes) > 0:
+            box = sorted(results[0].boxes, key=lambda x: x.conf, reverse=True)[0]
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            
+            # 轉換為 0~1 的相對座標
+            rel_x = cx / iw
+            rel_y = cy / ih
+            cls_name = self.model.names[int(box.cls)]
+            
+            return rel_x, rel_y, cls_name, locked_roi
+            
+        return None, None, None, locked_roi
 
     # ==========================================
-    # 區塊 B：指針追蹤與移動邏輯 (Movement)
+    # 區塊 B：按鍵控制與移動邏輯
     # ==========================================
-
-    def detect_template(self, gray_frame, template, threshold=0.70):
-        """支持 4 個方向動態旋轉匹配的指針檢測 (臨時替代 YOLO 確保能看見指針)"""
-        if template is None or gray_frame is None or gray_frame.size == 0: return None
-        
-        best_val = -1
-        best_loc = None
-        best_shape = None
-        
-        templates_4_dirs = [
-            template,
-            cv2.rotate(template, cv2.ROTATE_90_CLOCKWISE),
-            cv2.rotate(template, cv2.ROTATE_180),
-            cv2.rotate(template, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        ]
-        
-        for tpl in templates_4_dirs:
-            res = cv2.matchTemplate(gray_frame, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            
-            if max_val > best_val:
-                best_val = max_val
-                best_loc = max_loc
-                best_shape = tpl.shape
-                
-        if best_val > threshold:
-            return (best_loc[0] + best_shape[1]//2, best_loc[1] + best_shape[0]//2)
-            
-        return None
-
-    def Realtime_cursor_position(self):
-        # 佔位，目前暫時用 detect_template 解決 YOLO 尚未訓練的問題
-        pass
 
     def update_key_bg(self, key_str, press):
         """底層：發送按鍵到 Chiaki"""
@@ -182,230 +133,88 @@ class AutoPlatinumHand:
     def release_all_keys(self):
         for k in ['up', 'down', 'left', 'right']: self.update_key_bg(k, False)
 
-    def move_action(self, dx, dy):
-        """長按大範圍移動"""
-        self.update_key_bg('right', dx > 15)
-        self.update_key_bg('left', dx < -15)
-        self.update_key_bg('down', dy > 15)
-        self.update_key_bg('up', dy < -15)
+    def move_toward_target(self, current_x, current_y, target_x, target_y):
+        """基於歸一化誤差 (0~1) 決定按鍵策略"""
+        dx = target_x - current_x
+        dy = target_y - current_y
+        dist = math.hypot(dx, dy)
 
-    def refine_move(self, dx, dy):
-        """短按微調"""
-        self.update_key_bg('right', dx > 2)
-        self.update_key_bg('left', dx < -2)
-        self.update_key_bg('down', dy > 2)
-        self.update_key_bg('up', dy < -2)
+        # 🛑 誤差小於 1% (0.01) 視為到達目標
+        if dist < 0.01:
+            self.release_all_keys()
+            return True # 到達標記
 
-    def click_action(self):
-        """執行物理點擊"""
-        win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
-        time.sleep(0.05)
-        win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
-        print("✅ 實機點擊執行完畢")
+        # 🏃‍♂️ 大於 5% 誤差，長按全速移動
+        if abs(dx) > 0.05:
+            self.update_key_bg('right', dx > 0)
+            self.update_key_bg('left', dx < 0)
+        else:
+            # 微調階段，短按或釋放
+            self.update_key_bg('right', dx > 0.01)
+            self.update_key_bg('left', dx < -0.01)
 
-    # ==========================================
-    # 區塊 C：點擊決策與同步暫停 (Logic & Sync)
-    # ==========================================
-
-    def sync_check(self, yt_gray, chiaki_gray):
-        """每 60 幀模糊匹配邊沿 15% 確保畫面同步"""
-        yt_hash = self.get_sparse_hash(yt_gray)
-        ck_hash = self.get_sparse_hash(cv2.resize(chiaki_gray, (yt_gray.shape[1], yt_gray.shape[0])))
-        diff = np.mean(cv2.absdiff(yt_hash, ck_hash))
-        return diff < 60  # 放寬至 60 避免誤判
-
-    def get_sparse_hash(self, gray_frame):
-        h, w = gray_frame.shape
-        dh, dw = int(h * 0.15), int(w * 0.15)
-        step = 4 
-        top = gray_frame[0:dh, ::step].flatten()
-        bottom = gray_frame[h-dh:h, ::step].flatten()
-        left = gray_frame[dh:h-dh, 0:dw:step].flatten()
-        right = gray_frame[dh:h-dh, w-dw:w:step].flatten()
-        border_pixels = np.concatenate((top, bottom, left, right))
-        return border_pixels.astype(np.int16)
+        if abs(dy) > 0.05:
+            self.update_key_bg('down', dy > 0)
+            self.update_key_bg('up', dy < 0)
+        else:
+            self.update_key_bg('down', dy > 0.01)
+            self.update_key_bg('up', dy < -0.01)
+            
+        return False
 
     # ==========================================
     # 執行循環
     # ==========================================
 
-    def run_live_sync(self, start_time_sec=34):
-        with sync_playwright() as p:
-            # --- Playwright 與影片同步啟動 ---
-            browser = p.chromium.connect_over_cdp("http://localhost:9222")
-            page = next((pg for pg in browser.contexts[0].pages if "youtube" in pg.url), browser.contexts[0].pages[0])
-            video = page.wait_for_selector("video")
-            page.evaluate(f"document.querySelector('video').pause(); document.querySelector('video').currentTime = {start_time_sec};")
-            time.sleep(0.5)
-            
-            # --- 初始截圖與播放器定位 ---
-            self.camera = dxcam.create(output_idx=0, output_color="BGR") 
-            
-            full_grab = self.camera.grab()
-            while full_grab is None:
-                full_grab = self.camera.grab()
-                time.sleep(0.01)
+    def run_follower_test(self):
+        print("🚀 啟動視覺跟隨測試...")
+        print("請手動播放 YouTube 影片，腳本將嘗試讓 Chiaki 指針跟隨。")
+        print("👉 按 [Q] 退出。")
+        print("-" * 50)
+        
+        self.camera.start(target_fps=30, video_mode=True)
+        last_print_time = time.time()
+
+        try:
+            while True:
+                full_frame = self.camera.get_latest_frame()
+                if full_frame is None: continue
+
+                # 1. 獲取 YouTube 影片目標位置 (0~1)
+                yt_x, yt_y, yt_cls, self.yt_locked_roi = self.process_target_yolo(
+                    full_frame, "youtube", self.yt_locked_roi
+                )
                 
-            self.chaiki_ready(full_grab)
-            
-            # 🎯 啟動背景線程模式 (事件驅動)
-            self.camera.start(target_fps=30, video_mode=True)
+                # 2. 獲取 Chiaki 實機當前位置 (0~1)
+                ck_x, ck_y, ck_cls, self.ck_locked_roi = self.process_target_yolo(
+                    full_frame, "chiaki", self.ck_locked_roi
+                )
 
-            recording = False
-            start_tick = 0
-            prev_time = time.time()
-            last_print_time = time.time()
-            v_pos_prev = None  # 👈 確保這裡有初始化
+                # 3. 執行移動邏輯
+                if yt_x is not None and ck_x is not None:
+                    is_arrived = self.move_toward_target(ck_x, ck_y, yt_x, yt_y)
+                    status_str = "🛑 已鎖定" if is_arrived else "🏃‍♂️ 移動中"
+                else:
+                    self.release_all_keys()
+                    status_str = "👀 尋找目標中"
 
-            print("🚀 系統啟動：[Space] 開始/暫停 | [Q] 退出")
+                # 每秒打印狀態
+                curr_time = time.time()
+                if curr_time - last_print_time >= 1.0:
+                    y_str = f"YT:({yt_x:.3f}, {yt_y:.3f})" if yt_x else "YT: --"
+                    c_str = f"CK:({ck_x:.3f}, {ck_y:.3f})" if ck_x else "CK: --"
+                    print(f"⏱️ {status_str} | {y_str}  ->  {c_str}")
+                    last_print_time = curr_time
 
-            with torch.no_grad():
-                while True:
-                    # 🎯 阻塞等待新幀
-                    full_frame = self.camera.get_latest_frame()
-                    if full_frame is None: continue
+                # 退出機制
+                if win32api.GetAsyncKeyState(ord('Q')) & 0x8000:
+                    break
                     
-                    yt_frame = full_frame[self.yt_y:self.yt_y+self.yt_h, self.yt_x:self.yt_x+self.yt_w]
-                    chiaki_frame = full_frame[self.chiaki_y:self.chiaki_y+self.chiaki_h, self.chiaki_x:self.chiaki_x+self.chiaki_w]
-                    
-                    yt_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY)
-                    chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
-                    
-                    curr_time = time.time()
-
-                    # 1. 雙指針辨識 (使用 4 向檢測函數) 👈 確保變數在這裡產生
-                    v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
-                    c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.70)
-                    
-                    if v_pos: self.last_known_cursor_pos = v_pos
-                    if c_pos: self.chaiki_cursor_pos = c_pos
-
-                    # ⏱️ 每秒打印一次座標狀態
-                    if curr_time - last_print_time >= 1.0:
-                        print(f"⏱️ [座標即時監控] 影片目標: {self.last_known_cursor_pos} | 實機位置: {self.chaiki_cursor_pos}")
-                        last_print_time = curr_time
-
-                    if recording:
-                        # --- A. 取消嚴苛的靜止判斷，容忍影片像素抖動 ---
-                        # (移除了 is_v_stationary 邏輯)
-
-                        # --- B. 事件檢測 (場景變化 & ROI 變化) ---
-                        scene_changed = False
-                        roi_changed = False
-                        
-                        if self.last_full_gray_np is not None:
-                            # 檢測 Scene Change (放寬閾值到 35 防誤判)
-                            yt_hash = self.get_sparse_hash(yt_gray)
-                            prev_hash = self.get_sparse_hash(self.last_full_gray_np)
-                            if np.mean(cv2.absdiff(yt_hash, prev_hash)) > 35: 
-                                scene_changed = True
-
-                            # 檢測 ROI Change
-                            if v_pos:
-                                cx, cy = int(v_pos[0]), int(v_pos[1])
-                                h, w = yt_gray.shape
-                                x1, y1 = max(0, cx-40), max(0, cy-40)
-                                x2, y2 = min(w, cx+40), min(h, cy+40)
-                                curr_roi = yt_gray[y1:y2, x1:x2].copy()
-                                prev_roi = self.last_full_gray_np[y1:y2, x1:x2].copy()
-                                
-                                rh, rw = curr_roi.shape
-                                if rh > 20 and rw > 20:
-                                    curr_roi[rh//2-10:rh//2+10, rw//2-10:rw//2+10] = 0
-                                    prev_roi[rh//2-10:rh//2+10, rw//2-10:rw//2+10] = 0
-                                if np.mean(cv2.absdiff(curr_roi, prev_roi)) > 15:
-                                    roi_changed = True
-
-                        # --- C. 隊列注入 (依賴空間去重防氾濫) ---
-                        # 💡 移除了 is_v_stationary 條件，只要有變化就判定入隊
-                        if (curr_time - self.last_click_time > 0.2) and v_pos:
-                            if roi_changed or scene_changed:
-                                # 🛡️ 空間去重：如果隊列中已經有距離小於 20 像素的任務，視為同一次點擊，不再重複入隊
-                                is_duplicate = False
-                                for q in self.queue:
-                                    if math.hypot(q['pos'][0] - v_pos[0], q['pos'][1] - v_pos[1]) < 20:
-                                        is_duplicate = True
-                                        break
-                                
-                                if not is_duplicate:
-                                    self.queue.append({'pos': v_pos, 'status': 'moving'})
-                                    self.last_click_time = curr_time
-                                    event_name = "場景切換" if scene_changed else "ROI變化"
-                                    print(f"📥 點擊事件入隊 ({event_name})，目標: {v_pos}")
-
-                        # --- D. 隊列延遲執行 (增加剎車停頓機制) ---
-                        if self.queue:
-                            current_task = self.queue[0]
-                            target_v_pos = current_task['pos']
-                            
-                            if self.chaiki_cursor_pos:
-                                tx = target_v_pos[0] / self.scale_x
-                                ty = target_v_pos[1] / self.scale_y
-                                dx = tx - self.chaiki_cursor_pos[0]
-                                dy = ty - self.chaiki_cursor_pos[1]
-                                dist = math.hypot(dx, dy)
-
-                                # 🛡️ 剎車狀態機：確保指針停穩後再點擊
-                                if current_task.get('status') == 'braking':
-                                    # 如果已經在剎車狀態，等待 150ms 讓慣性消失
-                                    if curr_time - current_task.get('brake_time', 0) > 0.15:
-                                        self.click_action()
-                                        self.queue.pop(0) # 只有物理點擊完成後，才允許彈出隊列
-                                    else:
-                                        self.release_all_keys() # 剎車期間確保按鍵是鬆開的
-                                        
-                                elif dist <= 8:
-                                    # 剛剛到達目標，進入剎車狀態
-                                    self.release_all_keys()
-                                    self.queue[0]['status'] = 'braking'
-                                    self.queue[0]['brake_time'] = curr_time
-                                    print(f"🛑 到達目標區域，開始剎車制動...")
-                                    
-                                elif dist > 50:
-                                    self.move_action(dx, dy)
-                                else:
-                                    self.refine_move(dx, dy)
-                            else:
-                                self.release_all_keys()
-                        else:
-                            self.release_all_keys()
-
-                        # --- E. 每 60 幀邊沿 Sync Check ---
-                        self.frame_counter += 1
-                        if self.frame_counter >= 60:
-                            self.frame_counter = 0
-                            is_synced = self.sync_check(yt_gray, chiaki_gray)
-                            
-                            if not is_synced:
-                                self.sync_fail_count += 1
-                                if self.sync_fail_count >= 3 and not self.is_paused_by_sync:
-                                    page.evaluate("document.querySelector('video').pause();")
-                                    self.is_paused_by_sync = True
-                                    print("⏸️ 畫面不同步，自動暫停影片")
-                            else:
-                                self.sync_fail_count = 0
-                                if self.is_paused_by_sync:
-                                    page.evaluate("document.querySelector('video').play();")
-                                    self.is_paused_by_sync = False
-                                    print("▶️ 畫面已同步，自動恢復播放")
-
-                    # 🛑 確保迴圈最後更新這些歷史變數！
-                    self.last_full_gray_np = yt_gray.copy()
-                    v_pos_prev = v_pos
-
-                    key = cv2.waitKey(1) & 0xFF
-                    
-                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000: break
-                    if win32api.GetAsyncKeyState(win32con.VK_SPACE) & 0x01:
-                        recording = not recording
-                        page.evaluate(f"document.querySelector('video').{'play' if recording else 'pause'}()")
-                        if not recording: self.release_all_keys()
-                        print(f"狀態切換: {'執行中' if recording else '暫停'}")
-
+        finally:
+            self.release_all_keys()
             self.camera.stop()
-            browser.close()
-            cv2.destroyAllWindows()
+            print("🛑 測試結束。")
 
 if __name__ == "__main__":
-    agent = AutoPlatinumHand("https://www.youtube.com/watch?v=7K_NimshHUI")
-    agent.run_live_sync()
+    agent = AutoPlatinumHand()
+    agent.run_follower_test()
