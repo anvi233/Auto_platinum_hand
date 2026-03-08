@@ -1,0 +1,10 @@
+path: F:/PySpace/Auto_platinum_hand/dataset  # 這是相對於 train_yolo.py 的路徑
+train: images    # 訓練圖片路徑
+val: images      # 驗證路徑（先指向同一個，方便測試）
+
+# 這裡的順序必須和你 MakeSense 導出時的 ID 一致
+names:
+  0: Pointer
+  1: Waiting
+  2: Hold
+  3: Keep

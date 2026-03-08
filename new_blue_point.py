@@ -229,7 +229,7 @@ class AutoPlatinumHand:
     # 執行循環
     # ==========================================
 
-    def run_live_sync(self, start_time_sec=35):
+    def run_live_sync(self, start_time_sec=34):
         with sync_playwright() as p:
             # --- Playwright 與影片同步啟動 ---
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
@@ -254,7 +254,8 @@ class AutoPlatinumHand:
             recording = False
             start_tick = 0
             prev_time = time.time()
-            last_print_time = time.time() # 新增：用於控制每秒打印頻率
+            last_print_time = time.time()
+            v_pos_prev = None  # 👈 確保這裡有初始化
 
             print("🚀 系統啟動：[Space] 開始/暫停 | [Q] 退出")
 
@@ -272,7 +273,7 @@ class AutoPlatinumHand:
                     
                     curr_time = time.time()
 
-                    # 雙指針辨識 (使用 4 向檢測函數)
+                    # 1. 雙指針辨識 (使用 4 向檢測函數) 👈 確保變數在這裡產生
                     v_pos = self.detect_template(yt_gray, self.cursor_tpl, 0.70)
                     c_pos = self.detect_template(chiaki_gray, self.chiaki_cursor_tpl, 0.70)
                     
@@ -285,7 +286,10 @@ class AutoPlatinumHand:
                         last_print_time = curr_time
 
                     if recording:
-                        # --- A. 事件檢測 (場景變化 & ROI 變化) ---
+                        # --- A. 取消嚴苛的靜止判斷，容忍影片像素抖動 ---
+                        # (移除了 is_v_stationary 邏輯)
+
+                        # --- B. 事件檢測 (場景變化 & ROI 變化) ---
                         scene_changed = False
                         roi_changed = False
                         
@@ -312,19 +316,28 @@ class AutoPlatinumHand:
                                 if np.mean(cv2.absdiff(curr_roi, prev_roi)) > 15:
                                     roi_changed = True
 
-                        # --- B. 隊列注入 (事件驅動入隊) ---
-                        # 觸發條件：點擊間隔 > 200ms 且 (ROI背景變化 或 場景切換)
+                        # --- C. 隊列注入 (依賴空間去重防氾濫) ---
+                        # 💡 移除了 is_v_stationary 條件，只要有變化就判定入隊
                         if (curr_time - self.last_click_time > 0.2) and v_pos:
                             if roi_changed or scene_changed:
-                                if not any(q['pos'] == v_pos for q in self.queue):
-                                    self.queue.append({'pos': v_pos})
+                                # 🛡️ 空間去重：如果隊列中已經有距離小於 20 像素的任務，視為同一次點擊，不再重複入隊
+                                is_duplicate = False
+                                for q in self.queue:
+                                    if math.hypot(q['pos'][0] - v_pos[0], q['pos'][1] - v_pos[1]) < 20:
+                                        is_duplicate = True
+                                        break
+                                
+                                if not is_duplicate:
+                                    self.queue.append({'pos': v_pos, 'status': 'moving'})
                                     self.last_click_time = curr_time
                                     event_name = "場景切換" if scene_changed else "ROI變化"
                                     print(f"📥 點擊事件入隊 ({event_name})，目標: {v_pos}")
 
-                        # --- C. 隊列延遲執行 (Chiaki 移動與點擊) ---
+                        # --- D. 隊列延遲執行 (增加剎車停頓機制) ---
                         if self.queue:
-                            target_v_pos = self.queue[0]['pos']
+                            current_task = self.queue[0]
+                            target_v_pos = current_task['pos']
+                            
                             if self.chaiki_cursor_pos:
                                 tx = target_v_pos[0] / self.scale_x
                                 ty = target_v_pos[1] / self.scale_y
@@ -332,21 +345,32 @@ class AutoPlatinumHand:
                                 dy = ty - self.chaiki_cursor_pos[1]
                                 dist = math.hypot(dx, dy)
 
-                                if dist <= 8:
+                                # 🛡️ 剎車狀態機：確保指針停穩後再點擊
+                                if current_task.get('status') == 'braking':
+                                    # 如果已經在剎車狀態，等待 150ms 讓慣性消失
+                                    if curr_time - current_task.get('brake_time', 0) > 0.15:
+                                        self.click_action()
+                                        self.queue.pop(0) # 只有物理點擊完成後，才允許彈出隊列
+                                    else:
+                                        self.release_all_keys() # 剎車期間確保按鍵是鬆開的
+                                        
+                                elif dist <= 8:
+                                    # 剛剛到達目標，進入剎車狀態
                                     self.release_all_keys()
-                                    self.click_action()
-                                    self.queue.pop(0)
+                                    self.queue[0]['status'] = 'braking'
+                                    self.queue[0]['brake_time'] = curr_time
+                                    print(f"🛑 到達目標區域，開始剎車制動...")
+                                    
                                 elif dist > 50:
                                     self.move_action(dx, dy)
                                 else:
                                     self.refine_move(dx, dy)
                             else:
-                                # Chiaki 指針短暫丟失 -> 什麼都不做，等待下一幀重新識別
                                 self.release_all_keys()
                         else:
                             self.release_all_keys()
 
-                        # --- D. 每 60 幀邊沿 Sync Check ---
+                        # --- E. 每 60 幀邊沿 Sync Check ---
                         self.frame_counter += 1
                         if self.frame_counter >= 60:
                             self.frame_counter = 0
@@ -365,7 +389,9 @@ class AutoPlatinumHand:
                                     self.is_paused_by_sync = False
                                     print("▶️ 畫面已同步，自動恢復播放")
 
+                    # 🛑 確保迴圈最後更新這些歷史變數！
                     self.last_full_gray_np = yt_gray.copy()
+                    v_pos_prev = v_pos
 
                     key = cv2.waitKey(1) & 0xFF
                     
