@@ -1,19 +1,24 @@
 from ultralytics import YOLO
+import os
 
 if __name__ == '__main__':
-    # 🌟 載入真正成功的那個模型 (注意資料夾結尾的 2)
-    model_path = r'E:\Myst_Project\v2_ultimate_11002\weights\best.pt'
-    best_model = YOLO(model_path)
+    base_dir = r'E:\Myst_Project'
+    os.chdir(base_dir)
 
-    # 🌟 執行剛才沒跑完的自動標註
-    print("\n🚀 正在為 1100 張圖生成最新標籤庫...")
-    best_model.predict(
-        source=r'F:\PySpace\Auto_platinum_hand\dataset\images',
-        save_txt=True,
-        save=True,  # 依然保存圖片方便你肉眼 Check
-        project=r'E:\Myst_Project',
-        name='v2_final_check_labels',
-        conf=0.5
+    # 🌟 站在巨人的肩膀上：載入 V2 的完美權重
+    model = YOLO(r'E:\Myst_Project\v2_ultimate_11002\weights\best.pt') 
+
+    # 🌟 1900 張圖的終極訓練
+    model.train(
+        data=r'F:\PySpace\Auto_platinum_hand\data.yaml', 
+        epochs=100,        # 基礎已經很好了，100 輪足夠收斂
+        imgsz=640, 
+        device=0,
+        batch=8,           # 保持安全配置
+        workers=0,
+        project=base_dir, 
+        name='v3_final_1900',
+        cache=True,
+        plots=True
     )
-    
-    print("\n🏆 標籤與預覽圖生成完畢！")
+    print("\n🏆 1900 樣本終極視覺引擎誕生！")

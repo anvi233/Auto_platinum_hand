@@ -1,21 +1,18 @@
 from ultralytics import YOLO
-import os
 
-# 1. 載入剛出爐的模型
-model_path = r'E:\Myst_Project\v2_refined_260_samples\weights\best.pt'
-model = YOLO(model_path)
+if __name__ == '__main__':
+    # 🌟 載入剛剛練成的最強大腦 (注意路徑是 11002)
+    model_path = r'E:\Myst_Project\v2_ultimate_11002\weights\best.pt'
+    model = YOLO(model_path)
 
-# 2. 批量推理 1000+ 張圖 (dataset/images 資料夾)
-# save=True 會把結果存成圖片，你可以直接看
-# conf=0.5 設定信心門檻，低於 50% 的不顯示
-results = model.predict(
-    source=r'F:\PySpace\Auto_platinum_hand\dataset\youtube', 
-    save=True,
-    save_txt=True, 
-    conf=0.5, 
-    project=r'E:\Myst_Project\Inference_Test', 
-    name='full_check'
-)
-
-print(f"✅ 巡檢完成！請去 E:\Myst_Project\Inference_Test\full_check 裡看畫好框的圖。")
-
+    print("\n🚀 正在對最後的 800 張未知圖進行盲測...")
+    model.predict(
+        # 🌟 指向你存放剩下 800 張圖的專屬資料夾
+        source=r'F:\PySpace\Auto_platinum_hand\dataset\images_test800',
+        save=True,      # 存成圖片，方便你像翻幻燈片一樣快速肉眼驗收
+        save_txt=True,  # 順便把 txt 也吐出來，如果有極個別的錯可以直接改
+        conf=0.5,       # 保持實戰門檻
+        project=r'E:\Myst_Project\Final_Test',
+        name='blind_test_800'
+    )
+    print("\n🏆 盲測預測完畢！請前往 E:\Myst_Project\Final_Test\blind_test_800 驗收。")
