@@ -214,8 +214,8 @@ class AutoPlatinumHand:
             else:
                 self.update_key_bg(pos_key, False)
                 self.update_key_bg(neg_key, False)
-                # 微調區間：下探至 0.015 (1.5%)
-                if abs_d >= 0.015:
+                # 微調區間：下探至 0.005 (0.5%)
+                if abs_d >= 0.005:
                     # 💡 核心：使用測速常數 V=0.85 計算理論時間
                     raw_time = abs_d / 0.85
                     
@@ -482,14 +482,9 @@ class AutoPlatinumHand:
                 self.last_full_gray_np = None  
                 recording = True
                 
-                # 💡 注入 CSS 徹底隱藏 YouTube 播放列，防止淡出動畫觸發誤判
-                js_code = """
-                document.querySelector('video').play();
-                var style = document.createElement('style');
-                style.innerHTML = '.ytp-chrome-bottom, .ytp-chrome-top, .ytp-gradient-bottom, .ytp-gradient-top, .ytp-watermark { display: none !important; }';
-                document.head.appendChild(style);
-                """
-                page.evaluate(js_code)
+                # 💡 利用 Playwright 原生 API 安全注入 CSS 隱藏 YouTube UI，並啟動播放
+                page.evaluate("document.querySelector('video').play();")
+                page.add_style_tag(content='.ytp-chrome-bottom, .ytp-chrome-top, .ytp-gradient-bottom, .ytp-gradient-top, .ytp-watermark { display: none !important; }')
                 print("▶️ 影片自動播放，並已屏蔽 YouTube UI 干擾，進入全自動模式！")
 
                 while True:
