@@ -43,7 +43,8 @@ class AutoPlatinumHand:
         self.last_time_ms = 0.0
         self.last_full_gray_np = None
         
-        self.key_states = {'up': False, 'down': False, 'left': False, 'right': False}
+        # 💡 增加 'cross' 鍵位狀態初始化
+        self.key_states = {'up': False, 'down': False, 'left': False, 'right': False, 'cross': False}
         self.frame_counter = 0
         self.sync_fail_count = 0
         self.is_paused_by_sync = False
@@ -134,10 +135,6 @@ class AutoPlatinumHand:
     # 區塊 B：指針追蹤與移動邏輯 (Movement)
     # ==========================================
 
-    # ==========================================
-    # 區塊 B：指針追蹤與移動邏輯 (Movement)
-    # ==========================================
-
     def _get_lparam(self, vk, down=True):
         """
         根據 Chiaki 映射表構造精確的 lParam。
@@ -159,9 +156,13 @@ class AutoPlatinumHand:
         return lparam
 
     def update_key_bg(self, key_str, press):
-        """底層按鍵發送，增加終端打印日誌"""
+        """底層按鍵發送，增加終端打印日誌與跨鍵支持"""
         if not self.chiaki_hwnd: return
-        vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT}
+        vk_map = {
+            'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 
+            'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT,
+            'cross': win32con.VK_RETURN
+        }
         vk = vk_map.get(key_str)
         
         if self.key_states.get(key_str) != press:
@@ -178,7 +179,7 @@ class AutoPlatinumHand:
 
     def Realtime_cursor_position(self, bgr_frame):
         """YOLO 即時推論，返回: 歸一化座標(0-1), 類別名稱, 絕對像素座標"""
-        results = self.model.predict(bgr_frame, conf=0.6, verbose=False)
+        results = self.model.predict(bgr_frame, conf=0.2, verbose=False)
         if len(results[0].boxes) > 0:
             box = sorted(results[0].boxes, key=lambda x: x.conf, reverse=True)[0]
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
@@ -343,6 +344,8 @@ class AutoPlatinumHand:
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
             page = next((pg for pg in browser.contexts[0].pages if "youtube" in pg.url), browser.contexts[0].pages[0])
             video = page.wait_for_selector("video")
+            
+            # 確保影片暫停在起始時間點
             page.evaluate(f"document.querySelector('video').pause(); document.querySelector('video').currentTime = {start_time_sec};")
             time.sleep(0.5)
             
@@ -359,13 +362,60 @@ class AutoPlatinumHand:
             # 🎯 啟動背景線程模式
             self.camera.start(target_fps=30, video_mode=True)
 
-            # 🌟 直接進入全自動模式
-            recording = True
-            
-            page.evaluate("document.querySelector('video').play();")
-            print("▶️ 程式啟動，影片自動播放，進入全自動追蹤與同步模式！")
+            # ==========================================
+            # 🌟 新增：手動對齊準備階段
+            # ==========================================
+            print("\n" + "="*50)
+            print("⏳ 進入手動對齊模式...")
+            print("請手動點擊 Chiaki 視窗確保其獲得焦點，並將實機指針與影片大致對齊。")
+            print("👉 對齊完成後，請按下 [空白鍵 (SPACE)] 正式啟動自動控制！")
+            print("👉 隨時可按下 [Q] 鍵退出程式。")
+            print("="*50 + "\n")
 
+            aligned = False
+            align_frame_count = 0
+            
             with torch.no_grad():
+                while not aligned:
+                    full_frame = self.camera.get_latest_frame()
+                    if full_frame is None: continue
+
+                    # 抓取畫面
+                    yt_frame = full_frame[self.yt_y:self.yt_y+self.yt_h, self.yt_x:self.yt_x+self.yt_w]
+                    chiaki_frame = full_frame[self.chiaki_y:self.chiaki_y+self.chiaki_h, self.chiaki_x:self.chiaki_x+self.chiaki_w]
+                    
+                    # 每 15 幀 (約 0.5 秒) 打印一次當前檢測狀態，輔助人工對齊
+                    align_frame_count += 1
+                    if align_frame_count >= 15:
+                        yt_rel_pos, yt_cls, _ = self.Realtime_cursor_position(yt_frame)
+                        ck_rel_pos, ck_cls, _ = self.Realtime_cursor_position(chiaki_frame)
+                        
+                        yt_str = f"{yt_rel_pos[0]:.3f}, {yt_rel_pos[1]:.3f}" if yt_rel_pos else "未檢測到"
+                        ck_str = f"{ck_rel_pos[0]:.3f}, {ck_rel_pos[1]:.3f}" if ck_rel_pos else "未檢測到"
+                        print(f"🔧 [對齊中] 影片指針: ({yt_str}) | 實機指針: ({ck_str})")
+                        align_frame_count = 0
+
+                    # 檢測空白鍵 (SPACE) 開始
+                    if win32api.GetAsyncKeyState(win32con.VK_SPACE) & 0x8000:
+                        print("\n🚀 收到 [空白鍵]！結束對齊模式，正式啟動自動控制系統！\n")
+                        aligned = True
+                        time.sleep(0.5) # 防止按鍵連擊干擾後續邏輯
+
+                    # 檢測 Q 鍵安全退出
+                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000:
+                        print("🛑 收到 Q 鍵，系統安全退出...")
+                        self.camera.stop()
+                        browser.close()
+                        return
+                
+                # ==========================================
+                # 🌟 正式進入全自動模式
+                # ==========================================
+                self.frame_counter = 0 # 重置計數器
+                recording = True
+                page.evaluate("document.querySelector('video').play();")
+                print("▶️ 影片自動播放，進入全自動追蹤與同步模式！")
+
                 while True:
                     # 🎯 阻塞等待新幀
                     full_frame = self.camera.get_latest_frame()
@@ -377,16 +427,12 @@ class AutoPlatinumHand:
                     yt_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY)
                     chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
                     
-                    curr_time = time.time()
-
                     # 1. YOLO 推論
                     yt_rel_pos, yt_cls, yt_abs_pos = self.Realtime_cursor_position(yt_frame)
                     ck_rel_pos, ck_cls, ck_abs_pos = self.Realtime_cursor_position(chiaki_frame)
 
                     # **注意：使用 is not None 判斷，避免 (0.0,0.0) 被丟掉**
                     if yt_rel_pos is not None:
-                        # 偵測到影片游標
-                        # 如果停在同一個位置就把座標送到佇列
                         if self.last_video_rel is not None and yt_rel_pos == self.last_video_rel:
                             self.enqueue_video_pos(yt_rel_pos)
                         self.last_video_rel = yt_rel_pos
@@ -396,7 +442,6 @@ class AutoPlatinumHand:
                         self.chaiki_cursor_pos = ck_rel_pos
 
                     if recording:
-                        # 決定是否發出 pending click
                         if yt_rel_pos is not None:
                             roi_changed = self.is_roi_change(yt_gray,
                                                              yt_abs_pos[0] if yt_abs_pos else 0,
@@ -408,15 +453,13 @@ class AutoPlatinumHand:
                                 self.pending_click = True
                                 print('📥 point click pending')
 
-                        # 如果待辦點擊燈號亮，先把當前游標位置入佇列
                         if self.pending_click and self.last_known_cursor_pos is not None:
                             self.enqueue_video_pos(self.last_known_cursor_pos)
                             self.pending_click = False
 
-                        # 佇列處理（移動 + 點擊）
                         self.process_queue()
 
-                    # 4. 自動同步檢查：每 30 幀檢查一次
+                    # 4. 自動同步檢查
                     self.frame_counter += 1
                     if self.frame_counter >= 30:
                         self.frame_counter = 0
@@ -438,7 +481,6 @@ class AutoPlatinumHand:
 
                     self.last_full_gray_np = yt_gray.copy()
                     
-                    # 全局熱鍵退出
                     if win32api.GetAsyncKeyState(ord('Q')) & 0x8000:
                         print("🛑 收到 Q 鍵，系統安全退出...")
                         break
