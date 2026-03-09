@@ -273,42 +273,21 @@ class AutoPlatinumHand:
         return np.mean(cv2.absdiff(curr_hash, prev_hash)) > 35
 
     def is_scene_changed(self, current_gray, last_gray, cursor_x, cursor_y, is_sync_mode=False):
-        """
-        💡 雙軌判定：局部幾何特徵 (Canny) OR 全局結構分佈 (32x32)。
-        """
         if current_gray is None or last_gray is None: return False
         
-        # 1. 中值濾波：濾除馬賽克畫面的壓縮噪點，保留 2px 線條細節
-        curr_b = cv2.medianBlur(current_gray, 3)
-        last_b = cv2.medianBlur(last_gray, 3)
+        # 💡 模擬人眼：將畫面極度簡化為 32x32 網格，只看大體色塊跳變
+        curr_s = cv2.resize(current_gray, (32, 32))
+        last_s = cv2.resize(last_gray, (32, 32))
         
-        h, w = curr_b.shape
-        # 2. 局部 1/3 區域提取
-        rw, rh = w // 3, h // 3
-        rx1, ry1 = max(0, int(cursor_x - rw//2)), max(0, int(cursor_y - rh//2))
-        rx2, ry2 = min(w, rx1 + rw), min(h, ry1 + rh)
+        # 計算平均絕對誤差 (MAE)
+        diff_score = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
         
-        # 局部幾何評分 (Canny Edge) - 排除指針中心 60px 避免自干擾
-        curr_l_edge = cv2.Canny(curr_b[ry1:ry2, rx1:rx2], 50, 150)
-        last_l_edge = cv2.Canny(last_b[ry1:ry2, rx1:rx2], 50, 150)
-        
-        # 3. 全局結構評分 (下採樣 32x32) - 徹底無視拉伸與微小色差
-        curr_s = cv2.resize(curr_b, (32, 32))
-        last_s = cv2.resize(last_b, (32, 32))
-        
-        # 4. 計算得分
-        local_score = cv2.countNonZero(cv2.absdiff(curr_l_edge, last_l_edge)) / (rw * rh) if (rw*rh)>0 else 0
-        global_score = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
-        
-        # 💡 判定邏輯：任意條件達成即通過
-        # 💡 is_scene_changed 內部的最後判定
         if is_sync_mode:
-            # 同步模式：只要全局或局部有一邊是對上的，就算同步
-            # 我們反過來想：只有當 (全局大改) 且 (局部也大改) 時，才算「不同步」
-            return global_score > 0.08 and local_score > 0.10
+            # 同步模式：門檻調高，只有大範圍不一致才判定
+            return diff_score > 0.08
         else:
-            # 觸發模式：任意一處有動靜就算變化
-            return local_score > 0.045 or global_score > 0.05
+            # 觸發模式：3% 的變化足以捕捉 PS1 點擊閃爍
+            return diff_score > 0.03
 
     def sync_check(self, yt_gray, chiaki_gray):
         """💡 職能解耦：僅用於判斷是否暫停影片。"""
@@ -325,56 +304,62 @@ class AutoPlatinumHand:
 
     def process_queue(self, chiaki_gray=None, yt_gray=None):
         """
-        💡 職能解耦版：
-        1. 沒任務時 Roaming 跟隨。
-        2. 有任務時盯死 queue[0]，物理到位才點擊。
-        3. 點擊完成後 0.5s 自動銷毀，不看 sync_check。
+        💡 職能解耦診斷版：
+        1. 沒任務時執行 Roaming 跟隨。
+        2. 有任務時，物理距離 (dist) 是執行點擊的唯一門檻。
+        3. 任務彈出 (pop) 僅依賴點擊動作的完成，不再受 sync_check 干擾。
         """
         if not self.queue:
             if self.chaiki_cursor_pos and self.last_known_cursor_pos:
+                # 只有在沒任務時才打印漫遊狀態，減少日誌噪音
+                dist_roaming = math.hypot(self.chaiki_cursor_pos[0]-self.last_known_cursor_pos[0], 
+                                          self.chaiki_cursor_pos[1]-self.last_known_cursor_pos[1])
+                if dist_roaming > 0.05:
+                    print(f"👣 [Roaming] 跟隨影片指針中... 距離: {dist_roaming:.4f}")
                 self.move_action(self.chaiki_cursor_pos, self.last_known_cursor_pos)
             else:
                 self.release_all_keys()
             return
 
-        # 永遠只處理排在最前面的任務
+        # 鎖定隊列首位任務
         target_pos = self.queue[0]
         current_t = time.time()
         
-        # 獲取實機與目標的物理距離
+        # 獲取實機與當前目標的物理距離
         dist = math.hypot(target_pos[0]-self.chaiki_cursor_pos[0], target_pos[1]-self.chaiki_cursor_pos[1])
 
-        # --- 狀態 A：等待點擊動作完成後的物理冷卻 ---
+        # --- 狀態 A：執行點擊後的固定冷卻與銷毀 ---
         if getattr(self, 'click_validating', False):
             wait_time = current_t - self.val_start_time
-            # 點擊完畢給予 0.5s 讓模擬器反應，隨即彈出任務
-            if wait_time > 0.5:
-                print(f"✅ [Task Finished] 執行完畢，彈出任務: {target_pos} | 剩餘: {len(self.queue)-1}")
+            # 💡 模擬人眼邏輯：點擊完畢給予 0.6s 緩衝讓畫面反應，隨即彈出
+            if wait_time > 0.6:
+                print(f"✅ [Task Finished] 物理到位並執行點擊。彈出任務: {target_pos} | 剩餘: {len(self.queue)-1}")
                 self.queue.pop(0) 
                 self.click_validating = False
-                self.ignore_tasks_until = current_t + 0.1 # 極短冷卻防止粘連
+                self.ignore_tasks_until = current_t + 0.1 # 防止連續誤點擊的微小保護
             return
 
         # --- 狀態 B：執行移動與點擊決策 ---
+        # 1. 物理到位判定 (誤差小於 1.8%)
         if dist < 0.018:
-            # 💡 只有影片穩定時才准點擊，防止點在動畫中途
+            # 2. 影片穩定判定 (模擬人眼：畫面不閃爍時才點)
             if getattr(self, 'video_is_stable', True):
                 print(f"🔥 [EXECUTE CLICK] 🔥")
-                print(f"   - 任務目標 (Target): {target_pos}")
+                print(f"   - 隊列首位 (Target): {target_pos}")
                 print(f"   - 實機位置 (Actual): {self.chaiki_cursor_pos}")
                 print(f"   - 物理誤差 (Dist): {dist:.4f}")
+                print(f"   - 隊列總數 (Len): {len(self.queue)}")
                 
-                self.click_action()
+                self.click_action() # 執行物理點擊
                 self.click_validating = True
                 self.val_start_time = current_t
             else:
-                # 影片還在閃爍/動畫中，原地待命
+                # 影片還在劇烈變化中，為了精準度選擇原地等待一幀
                 self.release_all_keys()
         else:
-            # 距離還遠，繼續移動。
-            # 這裡打印移動目標，確保它沒有「變心」
+            # 距離還遠，僅執行移動，排除一切干擾專心走位
             if not hasattr(self, '_last_move_log') or current_t - self._last_move_log > 1.0:
-                print(f"🚚 [Moving] 正在前往任務點: {target_pos} | 當前距離: {dist:.4f}")
+                print(f"🚚 [Moving] 鎖定任務點: {target_pos} | 當前距離: {dist:.4f}")
                 self._last_move_log = current_t
             self.move_action(self.chaiki_cursor_pos, target_pos)
 
@@ -565,7 +550,31 @@ class AutoPlatinumHand:
                                     self.queue.append(new_task)
                                     print(f"📥 [New Task] {new_task} 加入隊列 | 總數: {len(self.queue)}")
                         
-                        self.last_yt_cls = yt_cls
+                        self.last_yt_cls = yt_cls# --- 任務入隊邏輯 ---
+                    if recording and not is_locked:
+                        # 💡 只有在非移動（Delta小）時才判斷場景變化，防止移動模糊誤觸
+                        is_moving = self.chaiki_cursor_pos and self.last_known_cursor_pos and \
+                                    math.hypot(self.chaiki_cursor_pos[0]-self.last_known_cursor_pos[0], 
+                                               self.chaiki_cursor_pos[1]-self.last_known_cursor_pos[1]) > 0.02
+
+                        if not is_moving and scene_changed:
+                            # 捕捉發生變化前的座標快照 (點擊回饋)
+                            priority_target = self.prev_intent_pos if self.prev_intent_pos else self.last_known_cursor_pos
+                            if priority_target:
+                                new_task = (float(priority_target[0]), float(priority_target[1]))
+                                if not self.queue or math.hypot(new_task[0]-self.queue[-1][0], new_task[1]-self.queue[-1][1]) > 0.04:
+                                    self.queue.append(new_task)
+                                    print(f"📥 [Vision Captured] 全景跳變入隊: {new_task}")
+
+                    # --- 5秒一次的心跳同步 (假設 30fps) ---
+                    self.sync_timer = getattr(self, 'sync_timer', 0) + 1
+                    if self.sync_timer >= 150:
+                        self.sync_timer = 0
+                        if not self.sync_check(yt_gray, chiaki_gray):
+                            print("🛑 [Sync Guard] 兩邊差距過大，暫停 5s 等待實機...")
+                            page.evaluate("document.querySelector('video').pause();")
+                            time.sleep(5.0)
+                            page.evaluate("document.querySelector('video').play();")
 
                     # 執行任務處理 (移動/點擊/驗證)
                     self.process_queue(chiaki_gray, yt_gray)
