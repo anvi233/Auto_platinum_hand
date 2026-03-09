@@ -182,6 +182,8 @@ class AutoPlatinumHand:
         dx = target_pos[0] - current_pos[0]
         dy = target_pos[1] - current_pos[1]
         
+        print(f"📍 Pos: Curr({current_pos[0]:.3f}, {current_pos[1]:.3f}) -> Target({target_pos[0]:.3f}, {target_pos[1]:.3f}) | Δ:({dx:.3f}, {dy:.3f})")
+
         def control_axis(delta, pos_key, neg_key):
             abs_d = abs(delta)
             if abs_d > 0.25: 
@@ -193,7 +195,8 @@ class AutoPlatinumHand:
                 self.update_key_bg(neg_key, False)
                 if abs_d >= 0.005:
                     raw_time = abs_d / 0.85
-                    pulse_time = max(0.04, min(0.18, raw_time + 0.035))
+                    # 💡 核心修改：將微調下限提升至 0.07 (70ms)，確保 Chiaki 能收到信號
+                    pulse_time = max(0.07, min(0.18, raw_time + 0.035))
                     key = pos_key if delta > 0 else neg_key
                     return (key, pulse_time)
                 return 0
@@ -206,6 +209,7 @@ class AutoPlatinumHand:
             max_pulse = max([t[1] for t in taps])
             tap_keys = [t[0] for t in taps]
             
+            print(f"🤏 [Math Adjust] Tapping {tap_keys} for {max_pulse*1000:.0f}ms (Compensated)...")
             vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT}
             
             for key in tap_keys:
@@ -235,14 +239,42 @@ class AutoPlatinumHand:
 
     def is_scene_changed(self, current_gray, last_gray, cursor_x, cursor_y, is_sync_mode=False):
         if current_gray is None or last_gray is None: return False
+        
+        # 1. 全域判定 (維持不變)
         curr_s = cv2.resize(current_gray, (32, 32))
         last_s = cv2.resize(last_gray, (32, 32))
-        diff_score = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
+        global_diff = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
         
         if is_sync_mode:
-            return diff_score > 0.08
-        else:
-            return diff_score > 0.03
+            return global_diff > 0.08
+            
+        # 💡 2. 局部加權判定 (指針附近 1/3 寬高重合區域)
+        h, w = current_gray.shape
+        bw, bh = w // 3, h // 3
+        
+        # 以指針為中心計算邊界，嚴格限制在畫面內
+        x1 = max(0, int(cursor_x - bw // 2))
+        y1 = max(0, int(cursor_y - bh // 2))
+        x2 = min(w, int(cursor_x + bw // 2))
+        y2 = min(h, int(cursor_y + bh // 2))
+        
+        local_diff = 0.0
+        # 確保擷取區域有效 (寬高大於0)
+        if x2 > x1 and y2 > y1:
+            # 截取兩幀在同一個物理座標範圍內的影像
+            curr_roi = current_gray[y1:y2, x1:x2]
+            last_roi = last_gray[y1:y2, x1:x2]
+            
+            # 將擷取出的局部區域也縮放到 32x32 計算平均差異
+            curr_roi_s = cv2.resize(curr_roi, (32, 32))
+            last_roi_s = cv2.resize(last_roi, (32, 32))
+            local_diff = np.mean(cv2.absdiff(curr_roi_s, last_roi_s)) / 255.0
+            
+        # 局部變化做 8 倍加權
+        weighted_local_diff = local_diff * 8.0
+        
+        # 💡 或 (OR) 條件判定：全域大於 0.03，或局部加權後大於 0.03
+        return global_diff > 0.03 or weighted_local_diff > 0.03
 
     def sync_check(self, yt_gray, chiaki_gray):
         if yt_gray is None or chiaki_gray is None: return True
@@ -304,7 +336,7 @@ class AutoPlatinumHand:
     # ------------------------------------------
     def execute_and_dequeue_click(self, current_t):
         """
-        實機端：無視畫面，死磕隊列目標。執行極度精確的 0.008 物理到位與雙幀確認。
+        實機端：無視畫面，死磕隊列目標。到位後立刻點擊，點完立刻出隊並前往下一個。
         """
         if not self.queue:
             if self.chaiki_cursor_pos and self.last_known_cursor_pos:
@@ -325,26 +357,21 @@ class AutoPlatinumHand:
         target_pos = self.queue[0]
         dist = math.hypot(target_pos[0]-self.chaiki_cursor_pos[0], target_pos[1]-self.chaiki_cursor_pos[1])
 
-        # --- 狀態 A：等待點擊動作完成後出隊 ---
-        if getattr(self, 'click_validating', False):
-            if current_t - self.val_start_time > 0.8: # 給予 0.8s 完成點擊動作
-                print(f"✅ [Task Finished] 彈出任務: {target_pos} | 剩餘: {len(self.queue)-1}")
-                self.queue.pop(0) 
-                self.click_validating = False
-            return
-
-        # --- 狀態 B：執行移動與點擊 ---
-        # 🌟 物理精確打擊：容差縮小至 0.008 (不到 1% 屏幕距離)，防止打滑提前開火
-        if dist < 0.008:
+        # 🌟 物理精確打擊：容差 0.012
+        if dist < 0.012:
             self.release_all_keys() # 剎車
             self.ck_stable_frames += 1
             
-            # 🌟 雙幀確認：連續兩幀都在 0.008 的靶心內才允許開火
+            # 🌟 雙幀確認：連續兩幀都在靶心內才允許開火
             if self.ck_stable_frames >= 2:
                 print(f"🔥 [EXECUTE CLICK] 物理精確到位 (dist={dist:.4f})，開火！")
                 self.click_action()
-                self.click_validating = True
-                self.val_start_time = current_t
+                
+                # 💡 核心修改：砍掉所有驗證與等待時間，點擊完瞬間彈出任務！
+                print(f"✅ [Task Finished] 點擊完成，瞬間彈出: {target_pos} | 剩餘: {len(self.queue)-1}")
+                self.queue.pop(0) 
+                
+                # 重置穩定幀，下一幀立刻開始追趕新任務
                 self.ck_stable_frames = 0
         else:
             self.ck_stable_frames = 0
@@ -434,33 +461,49 @@ class AutoPlatinumHand:
 
                     current_t = time.time()
                     
-                    # 1. 計算場景跳變
-                    scene_changed = False
-                    try:
-                        sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
-                        sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
-                        scene_changed = self.is_scene_changed(yt_gray, self.reference_gray, sx, sy)
-                    except:
+                    # 💡 核心修改 1：隊列滿 3 暫停影片邏輯
+                    if len(self.queue) >= 3 and not self.is_paused_by_sync:
+                        page.evaluate("document.querySelector('video').pause();")
+                        self.is_paused_by_sync = True
+                        print("⏸️ 隊列任務積壓達到 3 個，暫停影片並關閉檢測...")
+                        self.reference_gray = None # 清空底圖避免暫停 UI 污染
+                    elif len(self.queue) < 3 and getattr(self, 'sync_fail_count', 0) < 3 and self.is_paused_by_sync:
+                        page.evaluate("document.querySelector('video').play();")
+                        self.is_paused_by_sync = False
+                        print("▶️ 隊列與畫面均已對齊，恢復播放！")
+                        self.reference_gray = None # 恢復播放後重新獲取乾淨底圖
+
+                    # 💡 核心修改 2：物理隔離！暫停期間絕對不執行場景變化判定與入隊
+                    if not self.is_paused_by_sync:
                         scene_changed = False
-                    
-                    # 維護底圖 (果的表現)
-                    if scene_changed:
-                        self.reference_gray = yt_gray.copy()
-                        self.ref_frame_timer = 0
-                    else:
-                        self.ref_frame_timer += 1
-                        if self.ref_frame_timer >= 30:
-                            self.reference_gray = yt_gray.copy()
-                            self.ref_frame_timer = 0
+                        is_locked = getattr(self, 'click_validating', False)
+                        
+                        if not is_locked:
+                            try:
+                                sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
+                                sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
+                                scene_changed = self.is_scene_changed(yt_gray, self.reference_gray, sx, sy)
+                            except:
+                                scene_changed = False
+                            
+                            # 維護底圖 (果的表現)
+                            if scene_changed:
+                                self.reference_gray = yt_gray.copy()
+                                self.ref_frame_timer = 0
+                            else:
+                                self.ref_frame_timer += 1
+                                if self.ref_frame_timer >= 30:
+                                    self.reference_gray = yt_gray.copy()
+                                    self.ref_frame_timer = 0
 
-                    # 2. 影片端專屬：入隊邏輯 (判斷因)
-                    if recording and not getattr(self, 'click_validating', False):
-                        self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed)
+                            # 影片端專屬：入隊邏輯 (判斷因)
+                            if recording:
+                                self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed)
 
-                    # 3. 實機端專屬：出隊邏輯 (執行果)
+                    # 3. 實機端專屬：出隊邏輯 (執行果) - 實機必須持續處理隊列，不受暫停阻斷
                     self.execute_and_dequeue_click(current_t)
 
-                    # --- 定期同步檢查 ---
+                    # --- 定期同步檢查 (兼容舊版邏輯並加上防禦) ---
                     self.frame_counter += 1
                     if self.frame_counter >= 45:
                         self.frame_counter = 0
@@ -470,12 +513,14 @@ class AutoPlatinumHand:
                                 page.evaluate("document.querySelector('video').pause();")
                                 self.is_paused_by_sync = True
                                 print("⏸️ 畫面不同步，暫停影片...")
+                                self.reference_gray = None # 確保同步暫停時也清空底圖
                         else:
                             self.sync_fail_count = 0
-                            if self.is_paused_by_sync:
+                            if self.is_paused_by_sync and len(self.queue) < 3:
                                 page.evaluate("document.querySelector('video').play();")
                                 self.is_paused_by_sync = False
                                 print("▶️ 重新對齊，恢復播放！")
+                                self.reference_gray = None
 
                     if win32api.GetAsyncKeyState(ord('Q')) & 0x8000: 
                         break
