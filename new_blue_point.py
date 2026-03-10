@@ -154,12 +154,16 @@ class AutoPlatinumHand:
         }
         vk = vk_map.get(key_str)
         
-        if self.key_states.get(key_str) != press:
-            msg_name = "KEYDOWN" if press else "KEYUP"
-            # print(f"⌨️  [Chiaki Control] {key_str.upper()}: {msg_name}")
-            msg = win32con.WM_KEYDOWN if press else win32con.WM_KEYUP
-            win32api.PostMessage(self.chiaki_hwnd, msg, vk, self._get_lparam(vk, press))
-            self.key_states[key_str] = press
+        if press:
+            # 💡 核心修復：拔掉狀態鎖！只要需要按，每幀都狂發 KEYDOWN。
+            # 這能完美模擬真實鍵盤的長按連發，徹底粉碎模擬器吞鍵或軸衝突的問題。
+            win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk, self._get_lparam(vk, True))
+            self.key_states[key_str] = True
+        else:
+            # 鬆開時才檢查狀態，避免發送多餘的 KEYUP
+            if self.key_states.get(key_str) == True:
+                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk, self._get_lparam(vk, False))
+                self.key_states[key_str] = False
 
     def release_all_keys(self):
         for k in ['up', 'down', 'left', 'right']: self.update_key_bg(k, False)
@@ -182,47 +186,68 @@ class AutoPlatinumHand:
         dx = target_pos[0] - current_pos[0]
         dy = target_pos[1] - current_pos[1]
         
-        print(f"📍 Pos: Curr({current_pos[0]:.3f}, {current_pos[1]:.3f}) -> Target({target_pos[0]:.3f}, {target_pos[1]:.3f}) | Δ:({dx:.3f}, {dy:.3f})")
-
-        def control_axis(delta, pos_key, neg_key):
-            abs_d = abs(delta)
-            if abs_d > 0.25: 
-                self.update_key_bg(pos_key, delta > 0)
-                self.update_key_bg(neg_key, delta < 0)
-                return 0
-            else:
-                self.update_key_bg(pos_key, False)
-                self.update_key_bg(neg_key, False)
-                if abs_d >= 0.005:
-                    raw_time = abs_d / 0.85
-                    # 💡 核心修改：將微調下限提升至 0.07 (70ms)，確保 Chiaki 能收到信號
-                    pulse_time = max(0.07, min(0.18, raw_time + 0.035))
-                    key = pos_key if delta > 0 else neg_key
-                    return (key, pulse_time)
-                return 0
-
-        tap_x = control_axis(dx, 'right', 'left')
-        tap_y = control_axis(dy, 'down', 'up')
-        taps = [t for t in (tap_x, tap_y) if t != 0]
+        abs_dx = abs(dx)
+        abs_dy = abs(dy)
         
-        if taps:
-            max_pulse = max([t[1] for t in taps])
-            tap_keys = [t[0] for t in taps]
+        vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT}
+        executed_micro = False
+
+        # ==========================================
+        # 1. 絕對獨立處理 X 軸 (左右)
+        # ==========================================
+        if abs_dx > 0.25:
+            # 距離遠：開啟長按巡航，交給後台跑
+            self.update_key_bg('right', dx > 0)
+            self.update_key_bg('left', dx < 0)
+        else:
+            # 距離近：立刻關閉長按，準備精準微調
+            self.update_key_bg('right', False)
+            self.update_key_bg('left', False)
             
-            print(f"🤏 [Math Adjust] Tapping {tap_keys} for {max_pulse*1000:.0f}ms (Compensated)...")
-            vk_map = {'up': win32con.VK_UP, 'down': win32con.VK_DOWN, 'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT}
-            
-            for key in tap_keys:
-                vk = vk_map[key]
-                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk, self._get_lparam(vk, True))
-            
-            time.sleep(max_pulse)
-            
-            for key in tap_keys:
-                vk = vk_map[key]
-                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk, self._get_lparam(vk, False))
+            # 進入微調脈衝
+            if abs_dx >= 0.005:
+                x_key = 'right' if dx > 0 else 'left'
+                x_time = max(0.09, min(0.18, (abs_dx / 0.85) + 0.035))
                 
-            time.sleep(0.1)
+                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk_map[x_key], self._get_lparam(vk_map[x_key], True))
+                time.sleep(x_time)
+                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk_map[x_key], self._get_lparam(vk_map[x_key], False))
+                executed_micro = True
+
+        # ==========================================
+        # 2. 絕對獨立處理 Y 軸 (上下)
+        # ==========================================
+        if abs_dy > 0.25:
+            # 距離遠：開啟長按巡航，交給後台跑
+            self.update_key_bg('down', dy > 0)
+            self.update_key_bg('up', dy < 0)
+        else:
+            # 距離近：立刻關閉長按，準備精準微調
+            self.update_key_bg('down', False)
+            self.update_key_bg('up', False)
+            
+            # 進入微調脈衝
+            if abs_dy >= 0.005:
+                y_key = 'down' if dy > 0 else 'up'
+                y_time = max(0.09, min(0.18, (abs_dy / 0.85) + 0.035))
+                
+                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk_map[y_key], self._get_lparam(vk_map[y_key], True))
+                time.sleep(y_time)
+                win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYUP, vk_map[y_key], self._get_lparam(vk_map[y_key], False))
+                executed_micro = True
+
+        # ==========================================
+        # 3. 模擬器狀態防丟失保護 (終極保險)
+        # ==========================================
+        if executed_micro:
+            # 為什麼要這段？因為 Chiaki 的十字鍵/搖桿底層邏輯有互斥性。
+            # 如果 X 軸剛剛做完了微調並發送了 KEYUP，它可能會把正在長按趕路的 Y 軸也給打斷。
+            # 所以微調結束後，我們強行喚醒一次所有應該在「長按」狀態的按鍵！
+            for k, is_pressed in self.key_states.items():
+                if is_pressed:
+                    win32api.PostMessage(self.chiaki_hwnd, win32con.WM_KEYDOWN, vk_map[k], self._get_lparam(vk_map[k], True))
+            
+            time.sleep(0.08) # 給予畫面更新的緩衝時間
 
     def click_action(self):
         if not self.chiaki_hwnd: return
@@ -237,96 +262,132 @@ class AutoPlatinumHand:
     # 區塊 C：點擊決策與同步暫停 (職能解耦)
     # ==========================================
 
-    def is_scene_changed(self, current_gray, last_gray, cursor_x, cursor_y, is_sync_mode=False):
+    def is_scene_changed(self, current_gray, last_gray, curr_cx, curr_cy, last_cx, last_cy, is_sync_mode=False):
         if current_gray is None or last_gray is None: return False
         
-        # 1. 全域判定 (維持不變)
-        curr_s = cv2.resize(current_gray, (32, 32))
-        last_s = cv2.resize(last_gray, (32, 32))
-        global_diff = np.mean(cv2.absdiff(curr_s, last_s)) / 255.0
+        curr_clean = current_gray.copy()
+        last_clean = last_gray.copy()
+        h, w = curr_clean.shape
+        
+        # 確保塗黑區域嚴格限制為 35x35 (半徑 17)
+        mask_r = 18 
+        
+        def mask_out(cx, cy):
+            mx1, my1 = max(0, int(cx - mask_r)), max(0, int(cy - mask_r))
+            mx2, my2 = min(w, int(cx + mask_r)), min(h, int(cy + mask_r))
+            curr_clean[my1:my2, mx1:mx2] = 0
+            last_clean[my1:my2, mx1:mx2] = 0
+
+        # 將 A 點 (舊指針) 與 B 點 (新指針) 在兩張圖中同時塗黑 35x35
+        mask_out(curr_cx, curr_cy)
+        mask_out(last_cx, last_cy)
+
+        # 對位像素相減：計算所有剩餘純背景像素的絕對差值
+        diff_full = cv2.absdiff(curr_clean, last_clean)
+        
+        # 灰階差大於 3 (約 1%) 的像素標記為有效變化
+        _, thresh_full = cv2.threshold(diff_full, 3, 255, cv2.THRESH_BINARY)
+
+        # --- 全背景計算 ---
+        total_pixels = w * h
+        global_changed_pixels = np.count_nonzero(thresh_full)
         
         if is_sync_mode:
-            return global_diff > 0.08
-            
-        # 💡 2. 局部加權判定 (指針附近 1/3 寬高重合區域)
-        h, w = current_gray.shape
+            return global_changed_pixels > (total_pixels * 0.08)
+
+        # --- 1/3 區域計算 ---
         bw, bh = w // 3, h // 3
+        x1, y1 = max(0, int(curr_cx - bw // 2)), max(0, int(curr_cy - bh // 2))
+        x2, y2 = min(w, int(curr_cx + bw // 2)), min(h, int(curr_cy + bh // 2))
         
-        # 以指針為中心計算邊界，嚴格限制在畫面內
-        x1 = max(0, int(cursor_x - bw // 2))
-        y1 = max(0, int(cursor_y - bh // 2))
-        x2 = min(w, int(cursor_x + bw // 2))
-        y2 = min(h, int(cursor_y + bh // 2))
-        
-        local_diff = 0.0
-        # 確保擷取區域有效 (寬高大於0)
+        local_changed = False
         if x2 > x1 and y2 > y1:
-            # 截取兩幀在同一個物理座標範圍內的影像
-            curr_roi = current_gray[y1:y2, x1:x2]
-            last_roi = last_gray[y1:y2, x1:x2]
+            # 直接從對位相減的結果矩陣中切出 100% 重合的局部區域
+            thresh_local = thresh_full[y1:y2, x1:x2]
+            local_changed_pixels = np.count_nonzero(thresh_local)
             
-            # 將擷取出的局部區域也縮放到 32x32 計算平均差異
-            curr_roi_s = cv2.resize(curr_roi, (32, 32))
-            last_roi_s = cv2.resize(last_roi, (32, 32))
-            local_diff = np.mean(cv2.absdiff(curr_roi_s, last_roi_s)) / 255.0
-            
-        # 局部變化做 8 倍加權
-        weighted_local_diff = local_diff * 8.0
-        
-        # 💡 或 (OR) 條件判定：全域大於 0.03，或局部加權後大於 0.03
-        return global_diff > 0.03 or weighted_local_diff > 0.03
+            # 絕對數量判定：焦點區域內變動超過 100 個像素即算場景改變
+            if local_changed_pixels > 100:
+                local_changed = True
+
+        # 全背景變化 > 1%，或 1/3 區域變化像素 > 100
+        return (global_changed_pixels > total_pixels * 0.01) or local_changed
 
     def sync_check(self, yt_gray, chiaki_gray):
         if yt_gray is None or chiaki_gray is None: return True
         ck_res = cv2.resize(chiaki_gray, (self.yt_w, self.yt_h))
-        is_different = self.is_scene_changed(yt_gray, ck_res, 0, 0, is_sync_mode=True)
+        # 💡 補上缺少的指針參數 (0, 0, 0, 0 作為佔位)，避免 TypeError
+        is_different = self.is_scene_changed(yt_gray, ck_res, 0, 0, 0, 0, is_sync_mode=True)
         return not is_different
 
     # ------------------------------------------
     # 模塊 1: 影片端專屬 (捕捉因)
     # ------------------------------------------
-    def detect_and_enqueue_click(self, yt_rel_pos, yt_cls, scene_changed):
+    def save_debug_screenshot(self, frame, rel_pos, timestamp):
         """
-        影片端：負責維護動畫結界鎖，並在有效瞬間抓取游標意圖入隊。
+        保存帶有預判點擊位置的截圖，用於後續狀態機比對與除錯。
         """
-        # 1. 更新動畫結界鎖 (狀態機)
+        import os
+        os.makedirs('shotscreen', exist_ok=True)
+        
+        debug_frame = frame.copy()
+        h, w = debug_frame.shape[:2]
+        
+        # 轉換回絕對物理座標
+        abs_x = int(rel_pos[0] * w)
+        abs_y = int(rel_pos[1] * h)
+        
+        # 畫一個紅實心圓標示 YOLO 預計點擊的位置
+        cv2.circle(debug_frame, (abs_x, abs_y), 6, (0, 0, 255), -1)
+        
+        # 以系統時間戳為檔名保存
+        filename = f"shotscreen/{int(timestamp)}.jpg"
+        cv2.imwrite(filename, debug_frame)
+        print(f"📸 [Screenshot] 已保存點擊瞬間截圖至: {filename}")
+        
+    def detect_and_enqueue_click(self, yt_rel_pos, yt_cls, scene_changed, yt_frame):
+        # 如果正在暫停，我們需要不斷更新『基準時間』
+        if getattr(self, 'is_paused_by_sync', False):
+            self.last_yt_trigger_time = time.time()
+            return
+
+        # --- 動畫鎖邏輯 ---
         scene_jump_triggered = False
         if scene_changed:
             self.scene_stable_frames = 0
             if not self.is_scene_changing:
                 self.is_scene_changing = True
-                scene_jump_triggered = True  # 🌟 剛好開始跳變的「第一瞬間」
+                scene_jump_triggered = True 
         else:
             self.scene_stable_frames += 1
-            if self.scene_stable_frames >= 10:  # 連續 10 幀穩定，解除動畫鎖定
+            if self.scene_stable_frames >= 10:
                 self.is_scene_changing = False
 
-        # 2. 觸發判定
         cursor_changed = (yt_rel_pos and self.last_yt_cls and yt_cls != self.last_yt_cls and yt_cls in ('Hold', 'Keep', 'Waiting'))
-        is_pointer_stable = (self.prev_intent_pos is not None)
+        trigger = scene_jump_triggered or (cursor_changed and not self.is_scene_changing)
 
-        trigger = False
-        trigger_reason = ""
-
-        # 🌟 結界核心邏輯：跳變的瞬間，或是「不在動畫中」的游標變化
-        if scene_jump_triggered and is_pointer_stable:
-            trigger = True
-            trigger_reason = "場景跳變(動畫起點)"
-        elif cursor_changed and not self.is_scene_changing:
-            trigger = True
-            trigger_reason = "游標變化(畫面穩定時)"
-
-        # 3. 執行入隊
         if trigger:
             priority_target = self.prev_intent_pos if self.prev_intent_pos else self.last_known_cursor_pos
             if priority_target:
                 new_pos = (float(priority_target[0]), float(priority_target[1]))
                 
-                # 防呆：距離上次點擊位置大於 2% 才允許入隊
-                if not self.queue or math.hypot(new_pos[0]-self.queue[-1][0], new_pos[1]-self.queue[-1][1]) > 0.02:
-                    self.queue.append(new_pos)
-                    print(f"📥 [New Task] {new_pos} 入隊 ({trigger_reason}) | 總數: {len(self.queue)}")
-                    # 入隊後清空快照，避免重複觸發
+                current_real_t = time.time()
+                if not hasattr(self, 'last_yt_trigger_time'):
+                    self.last_yt_trigger_time = current_real_t
+                
+                dt_gap = current_real_t - self.last_yt_trigger_time
+                
+                # 0.5s 物理防抖
+                if not hasattr(self, 'last_enqueue_real_t') or (current_real_t - self.last_enqueue_real_t > 0.5):
+                    self.last_yt_trigger_time = current_real_t 
+                    
+                    self.queue.append({'pos': new_pos, 'dt': dt_gap})
+                    self.last_enqueue_real_t = current_real_t
+                    print(f"📥 [New Task] {new_pos} 入隊 | 影片真實間隔: {dt_gap:.2f}s | 總數: {len(self.queue)}")
+                    
+                    # 💡 呼叫獨立出來的截圖函數
+                    self.save_debug_screenshot(yt_frame, new_pos, current_real_t)
+
                     self.prev_intent_pos = None 
 
         self.last_yt_cls = yt_cls
@@ -335,49 +396,43 @@ class AutoPlatinumHand:
     # 模塊 2: 實機端專屬 (執行果)
     # ------------------------------------------
     def execute_and_dequeue_click(self, current_t):
-        """
-        實機端：無視畫面，死磕隊列目標。到位後立刻點擊，點完立刻出隊並前往下一個。
-        """
-        if not self.queue:
-            if self.chaiki_cursor_pos and self.last_known_cursor_pos:
-                dist_roaming = math.hypot(self.chaiki_cursor_pos[0]-self.last_known_cursor_pos[0], 
-                                          self.chaiki_cursor_pos[1]-self.last_known_cursor_pos[1])
-                if dist_roaming > 0.05:
-                    if not hasattr(self, '_last_roaming_log') or current_t - self._last_roaming_log > 2.0:
-                        print(f"👣 [Roaming] 跟隨影片指針中... 距離: {dist_roaming:.4f}")
-                        self._last_roaming_log = current_t
-                self.move_action(self.chaiki_cursor_pos, self.last_known_cursor_pos)
-            else:
-                self.release_all_keys()
-            self.ck_stable_frames = 0
-            return
-
+        if not self.queue: return
         if not self.chaiki_cursor_pos: return
 
-        target_pos = self.queue[0]
+        task = self.queue[0]
+        target_pos = task['pos']
+        required_dt = task['dt']
+        
+        # 【解釋】計算當前指針到目標的距離
         dist = math.hypot(target_pos[0]-self.chaiki_cursor_pos[0], target_pos[1]-self.chaiki_cursor_pos[1])
 
-        # 🌟 物理精確打擊：容差 0.012
+        # 【解釋】如果距離小於 0.012，準備開火
         if dist < 0.012:
-            self.release_all_keys() # 剎車
+            # 【解釋】剎車，重置按鍵狀態，並累加雙幀確認計數
+            self.release_all_keys()
             self.ck_stable_frames += 1
             
-            # 🌟 雙幀確認：連續兩幀都在靶心內才允許開火
+            # 【解釋】連續兩幀到位，進入時間判定
             if self.ck_stable_frames >= 2:
-                print(f"🔥 [EXECUTE CLICK] 物理精確到位 (dist={dist:.4f})，開火！")
-                self.click_action()
+                # 【解釋】計算距離上次點擊過去了多久
+                time_since_last_click = current_t - getattr(self, 'last_ck_click_finish_time', 0.0)
                 
-                # 💡 核心修改：砍掉所有驗證與等待時間，點擊完瞬間彈出任務！
-                print(f"✅ [Task Finished] 點擊完成，瞬間彈出: {target_pos} | 剩餘: {len(self.queue)-1}")
-                self.queue.pop(0) 
-                
-                # 重置穩定幀，下一幀立刻開始追趕新任務
-                self.ck_stable_frames = 0
+                if time_since_last_click >= required_dt:
+                    print(f"🔥 [EXECUTE CLICK] 滿足影片間隔 ({required_dt:.2f}s)，執行點擊！")
+                    self.click_action()
+                    
+                    # 【解釋】記錄本次點擊完成時間
+                    self.last_ck_click_finish_time = time.time()
+                    print(f"✅ [Task Finished] 彈出: {target_pos}")
+                    self.queue.pop(0) 
+                    
+                    # 💡 這裡必須加回來！點擊完成並彈出任務後，必須重置穩定幀，否則下一個任務一進來就會被瞬間誤判為「已穩定」
+                    self.ck_stable_frames = 0
+                else:
+                    pass
         else:
+            # 【解釋】距離不夠，重置雙幀計數並繼續移動
             self.ck_stable_frames = 0
-            if not hasattr(self, '_last_move_log') or current_t - self._last_move_log > 1.0:
-                print(f"🚚 [Moving] 鎖定任務點: {target_pos} | 當前距離: {dist:.4f}")
-                self._last_move_log = current_t
             self.move_action(self.chaiki_cursor_pos, target_pos)
 
 
@@ -461,7 +516,18 @@ class AutoPlatinumHand:
 
                     current_t = time.time()
                     
-                    # 💡 核心修改 1：隊列滿 3 暫停影片邏輯
+                    # 💡 確保算出當前幀的絕對座標 (sx, sy)
+                    try:
+                        sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
+                        sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
+                    except:
+                        sx, sy = int(0.5 * self.yt_w), int(0.5 * self.yt_h)
+
+                    # 💡 初始化底圖的指針座標 (給第一幀使用)
+                    if not hasattr(self, 'ref_cursor_x'):
+                        self.ref_cursor_x, self.ref_cursor_y = sx, sy
+
+                    # 隊列滿 3 暫停影片邏輯
                     if len(self.queue) >= 3 and not self.is_paused_by_sync:
                         page.evaluate("document.querySelector('video').pause();")
                         self.is_paused_by_sync = True
@@ -473,32 +539,43 @@ class AutoPlatinumHand:
                         print("▶️ 隊列與畫面均已對齊，恢復播放！")
                         self.reference_gray = None # 恢復播放後重新獲取乾淨底圖
 
-                    # 💡 核心修改 2：物理隔離！暫停期間絕對不執行場景變化判定與入隊
+                    # 物理隔離！暫停期間絕對不執行場景變化判定與入隊
                     if not self.is_paused_by_sync:
                         scene_changed = False
                         is_locked = getattr(self, 'click_validating', False)
                         
                         if not is_locked:
+                            # 🛡️ 安全機制：如果底圖被清空(例如剛從暫停恢復)，立即重新獲取底圖和底圖指針
+                            if self.reference_gray is None:
+                                self.reference_gray = yt_gray.copy()
+                                self.ref_cursor_x, self.ref_cursor_y = sx, sy
+                                self.ref_frame_timer = 0
+
                             try:
-                                sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
-                                sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
-                                scene_changed = self.is_scene_changed(yt_gray, self.reference_gray, sx, sy)
-                            except:
+                                # 💡 傳入 6 個參數：當前圖, 底圖, 當前指針X/Y, 底圖指針X/Y
+                                scene_changed = self.is_scene_changed(
+                                    yt_gray, self.reference_gray, 
+                                    sx, sy, 
+                                    self.ref_cursor_x, self.ref_cursor_y
+                                )
+                            except Exception as e:
                                 scene_changed = False
                             
-                            # 維護底圖 (果的表現)
+                            # 維護底圖與其對應的指針座標
                             if scene_changed:
                                 self.reference_gray = yt_gray.copy()
+                                self.ref_cursor_x, self.ref_cursor_y = sx, sy
                                 self.ref_frame_timer = 0
                             else:
                                 self.ref_frame_timer += 1
-                                if self.ref_frame_timer >= 30:
+                                if self.ref_frame_timer >= 30: # 每秒定期刷新底圖
                                     self.reference_gray = yt_gray.copy()
+                                    self.ref_cursor_x, self.ref_cursor_y = sx, sy
                                     self.ref_frame_timer = 0
 
                             # 影片端專屬：入隊邏輯 (判斷因)
                             if recording:
-                                self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed)
+                                self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed, yt_frame)
 
                     # 3. 實機端專屬：出隊邏輯 (執行果) - 實機必須持續處理隊列，不受暫停阻斷
                     self.execute_and_dequeue_click(current_t)
