@@ -439,6 +439,87 @@ class AutoPlatinumHand:
     # ==========================================
     # 執行循環 (主幹瘦身)
     # ==========================================
+    def process_video_vision(self, current_t, yt_frame, yt_gray, yt_rel_pos, yt_cls, yt_abs_pos, recording, page):
+        """
+        處理影片端的所有視覺邏輯：座標轉換、暫停控制、場景判定、底圖刷新、任務入隊。
+        """
+        # 1. 更新已知意圖座標
+        if yt_rel_pos is not None:
+            self.last_known_cursor_pos = yt_rel_pos
+            self.prev_intent_pos = (float(yt_rel_pos[0]), float(yt_rel_pos[1]))
+        elif not self.queue:
+            self.release_all_keys()
+
+        # 2. 確保算出當前幀的絕對座標 (sx, sy) 用於挖空指針
+        try:
+            sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
+            sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
+        except:
+            sx, sy = int(0.5 * self.yt_w), int(0.5 * self.yt_h)
+
+        # 3. 初始化底圖 (給第一幀使用)
+        if not hasattr(self, 'reference_gray') or self.reference_gray is None:
+            self.reference_gray = yt_gray.copy()
+            self.ref_cursor_x, self.ref_cursor_y = sx, sy
+
+        # 4. 隊列與影片播放/暫停控制
+        if len(self.queue) >= 3 and not self.is_paused_by_sync:
+            page.evaluate("document.querySelector('video').pause();")
+            self.is_paused_by_sync = True
+            print("⏸️ 隊列任務積壓達到 3 個，暫停影片並關閉檢測...")
+            self.reference_gray = None # 暫停時清空底圖，避免 UI 污染
+            return
+        elif len(self.queue) < 3 and getattr(self, 'sync_fail_count', 0) < 3 and self.is_paused_by_sync:
+            page.evaluate("document.querySelector('video').play();")
+            self.is_paused_by_sync = False
+            print("▶️ 隊列與畫面均已對齊，恢復播放！")
+            self.reference_gray = None # 恢復播放時清空，強制下一幀重新獲取
+            return
+
+        # 5. 場景判定與入隊 (僅在未暫停且未被點擊鎖定時執行)
+        if not self.is_paused_by_sync and not getattr(self, 'click_validating', False):
+            # 防禦機制：如果底圖丟失，立刻補上
+            if self.reference_gray is None:
+                self.reference_gray = yt_gray.copy()
+                self.ref_cursor_x, self.ref_cursor_y = sx, sy
+
+            try:
+                # ==========================================
+                # 💡 CV 工作區間：效能測試與逐幀保存 (存入 shotscreen)
+                # ==========================================
+                curr_time = time.time()
+                # 檔名加上 cv_ 前綴與毫秒時間戳，方便與原有的點擊截圖區分
+                cv2.imwrite(f"shotscreen/cv_{int(curr_time * 1000)}.jpg", yt_frame)
+                
+                # 初始化 FPS 計時器
+                if not hasattr(self, 'cv_fps_counter'):
+                    self.cv_fps_counter = 0
+                    self.cv_fps_start_time = curr_time
+                
+                # 計算真實 FPS
+                self.cv_fps_counter += 1
+                if curr_time - self.cv_fps_start_time >= 1.0:
+                    print(f"⏱️ [CV 分析效能] 當前實際每秒處理: {self.cv_fps_counter} 幀 (FPS)")
+                    self.cv_fps_counter = 0
+                    self.cv_fps_start_time = curr_time
+                # ==========================================
+
+                # 執行嚴格的 1% 背景像素變化判定
+                scene_changed = self.is_scene_changed(
+                    yt_gray, self.reference_gray, 
+                    sx, sy, 
+                    self.ref_cursor_x, self.ref_cursor_y
+                )
+            except Exception:
+                scene_changed = False
+
+            # 入隊邏輯
+            if recording:
+                self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed, yt_frame)
+
+            # 💡 核心修改：徹底廢除 30 幀定時器，每一幀無條件刷新底圖！
+            self.reference_gray = yt_gray.copy()
+            self.ref_cursor_x, self.ref_cursor_y = sx, sy
 
     def run_live_sync(self, start_time_sec=34):
         with sync_playwright() as p:
@@ -491,10 +572,6 @@ class AutoPlatinumHand:
                     yt_gray = cv2.cvtColor(yt_frame, cv2.COLOR_BGR2GRAY)
                     chiaki_gray = cv2.cvtColor(chiaki_frame, cv2.COLOR_BGR2GRAY)
 
-                    if not hasattr(self, 'reference_gray') or self.reference_gray is None:
-                        self.reference_gray = yt_gray.copy()
-                        self.ref_frame_timer = 0
-
                     yt_rel_pos, yt_cls, yt_abs_pos = self.Realtime_cursor_position(yt_frame)
                     ck_rel_pos, ck_cls, ck_abs_pos = self.Realtime_cursor_position(chiaki_frame)
 
@@ -504,103 +581,20 @@ class AutoPlatinumHand:
                         self.release_all_keys()
                         continue
 
-                    # 更新已知意圖座標 (確保在場景變換前一刻留存)
-                    if yt_rel_pos is not None:
-                        self.last_known_cursor_pos = yt_rel_pos
-                        self.prev_intent_pos = (float(yt_rel_pos[0]), float(yt_rel_pos[1]))
-                    else:
-                        if not self.queue: self.release_all_keys()
-
                     if ck_rel_pos is not None: 
                         self.chaiki_cursor_pos = ck_rel_pos
 
                     current_t = time.time()
-                    
-                    # 💡 確保算出當前幀的絕對座標 (sx, sy)
-                    try:
-                        sx = yt_abs_pos[0] if yt_abs_pos else int((self.last_known_cursor_pos[0] if self.last_known_cursor_pos else 0.5) * self.yt_w)
-                        sy = yt_abs_pos[1] if yt_abs_pos else int((self.last_known_cursor_pos[1] if self.last_known_cursor_pos else 0.5) * self.yt_h)
-                    except:
-                        sx, sy = int(0.5 * self.yt_w), int(0.5 * self.yt_h)
 
-                    # 💡 初始化底圖的指針座標 (給第一幀使用)
-                    if not hasattr(self, 'ref_cursor_x'):
-                        self.ref_cursor_x, self.ref_cursor_y = sx, sy
+                    # ==========================================
+                    # 💡 模塊解耦 1：將影片畫面丟給獨立的控制器去處理所有入隊與暫停邏輯
+                    # ==========================================
+                    self.process_video_vision(current_t, yt_frame, yt_gray, yt_rel_pos, yt_cls, yt_abs_pos, recording, page)
 
-                    # 隊列滿 3 暫停影片邏輯
-                    if len(self.queue) >= 3 and not self.is_paused_by_sync:
-                        page.evaluate("document.querySelector('video').pause();")
-                        self.is_paused_by_sync = True
-                        print("⏸️ 隊列任務積壓達到 3 個，暫停影片並關閉檢測...")
-                        self.reference_gray = None # 清空底圖避免暫停 UI 污染
-                    elif len(self.queue) < 3 and getattr(self, 'sync_fail_count', 0) < 3 and self.is_paused_by_sync:
-                        page.evaluate("document.querySelector('video').play();")
-                        self.is_paused_by_sync = False
-                        print("▶️ 隊列與畫面均已對齊，恢復播放！")
-                        self.reference_gray = None # 恢復播放後重新獲取乾淨底圖
-
-                    # 物理隔離！暫停期間絕對不執行場景變化判定與入隊
-                    if not self.is_paused_by_sync:
-                        scene_changed = False
-                        is_locked = getattr(self, 'click_validating', False)
-                        
-                        if not is_locked:
-                            # 🛡️ 安全機制：如果底圖被清空(例如剛從暫停恢復)，立即重新獲取底圖和底圖指針
-                            if self.reference_gray is None:
-                                self.reference_gray = yt_gray.copy()
-                                self.ref_cursor_x, self.ref_cursor_y = sx, sy
-                                self.ref_frame_timer = 0
-
-                            try:
-                                # 💡 傳入 6 個參數：當前圖, 底圖, 當前指針X/Y, 底圖指針X/Y
-                                scene_changed = self.is_scene_changed(
-                                    yt_gray, self.reference_gray, 
-                                    sx, sy, 
-                                    self.ref_cursor_x, self.ref_cursor_y
-                                )
-                            except Exception as e:
-                                scene_changed = False
-                            
-                            # 維護底圖與其對應的指針座標
-                            if scene_changed:
-                                self.reference_gray = yt_gray.copy()
-                                self.ref_cursor_x, self.ref_cursor_y = sx, sy
-                                self.ref_frame_timer = 0
-                            else:
-                                self.ref_frame_timer += 1
-                                if self.ref_frame_timer >= 30: # 每秒定期刷新底圖
-                                    self.reference_gray = yt_gray.copy()
-                                    self.ref_cursor_x, self.ref_cursor_y = sx, sy
-                                    self.ref_frame_timer = 0
-
-                            # 影片端專屬：入隊邏輯 (判斷因)
-                            if recording:
-                                self.detect_and_enqueue_click(yt_rel_pos, yt_cls, scene_changed, yt_frame)
-
-                    # 3. 實機端專屬：出隊邏輯 (執行果) - 實機必須持續處理隊列，不受暫停阻斷
+                    # ==========================================
+                    # 💡 模塊解耦 2：實機端不受干擾，獨立持續出隊並執行點擊
+                    # ==========================================
                     self.execute_and_dequeue_click(current_t)
-
-                    # --- 定期同步檢查 (兼容舊版邏輯並加上防禦) ---
-                    self.frame_counter += 1
-                    if self.frame_counter >= 45:
-                        self.frame_counter = 0
-                        if not getattr(self, 'click_validating', False) and not self.sync_check(yt_gray, chiaki_gray):
-                            self.sync_fail_count += 1
-                            if self.sync_fail_count >= 3 and not self.is_paused_by_sync:
-                                page.evaluate("document.querySelector('video').pause();")
-                                self.is_paused_by_sync = True
-                                print("⏸️ 畫面不同步，暫停影片...")
-                                self.reference_gray = None # 確保同步暫停時也清空底圖
-                        else:
-                            self.sync_fail_count = 0
-                            if self.is_paused_by_sync and len(self.queue) < 3:
-                                page.evaluate("document.querySelector('video').play();")
-                                self.is_paused_by_sync = False
-                                print("▶️ 重新對齊，恢復播放！")
-                                self.reference_gray = None
-
-                    if win32api.GetAsyncKeyState(ord('Q')) & 0x8000: 
-                        break
 
             self.camera.stop()
             browser.close()
